@@ -11,7 +11,7 @@ No special hardware needed.
 - **System tray**: closing the window keeps the mixer running in the tray.
 - **OpenDeck plugin** (`opendeck/`): control the mixer from a real Stream Deck through [OpenDeck](https://github.com/nekename/OpenDeck).
 
-Audio passes through untouched. At 100% faders the signal is bit-identical; the graph stays at the server's sample rate in 32-bit float. The only cost is about 20 ms of loopback latency per hop.
+Audio passes through untouched. At 100% faders the signal is bit-identical; the graph stays at the server's sample rate in 32-bit float. The added delay is about 9 ms (5 ms loopback buffers). Set `"latency_ms"` in the config to change it: 3 gives about 4 ms but runs PipeWire at a 1 ms period.
 
 ## Requirements
 

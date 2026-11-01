@@ -36,7 +36,12 @@ APP_ID = "io.github.lawsonf.AudioMixer"
 CONF = os.environ.get("AMX_CONFIG") or os.path.join(
     GLib.get_user_config_dir(), "audio-mixer", "config.json")
 FULL = 65536  # pulse "100%"
-LINK_LATENCY_MS = 20
+# Buffer per loopback hop. Measured on PipeWire: every path stays bit-identical with no dropouts at
+# 2-20 ms, even with all CPU cores busy. The two hops (channel -> mix -> output) add ~35 ms at 20,
+# ~14 ms at 10, ~9 ms at 5 and ~4 ms at 3. A loopback asks for a graph period of a third of this
+# (5 ms -> 64 frames), and the whole graph follows, so going lower raises the risk of crackles in
+# busy apps. Override with "latency_ms" in config.json (then restart the mixer).
+LINK_LATENCY_MS = 5
 
 
 def pactl(*args, js=False):
@@ -635,7 +640,7 @@ class Engine:
             if src.endswith(".monitor") and src[:-8] not in sink_names:
                 continue
             out = pactl("load-module", "module-loopback", f"source={src}", f"sink={sink}",
-                        f"latency_msec={LINK_LATENCY_MS}", "source_dont_move=true",
+                        f"latency_msec={self.link_latency()}", "source_dont_move=true",
                         "sink_dont_move=true")
             if out and out.isdigit():
                 self.links[key] = (int(out), now, src, sink)
@@ -648,6 +653,12 @@ class Engine:
         self.apply_default_mic()
         self.enforce_app_rules(sink_names)
         self.enforce_rec_rules()
+
+    def link_latency(self):
+        try:
+            return max(1, min(200, int(self.cfg.get("latency_ms") or LINK_LATENCY_MS)))
+        except (TypeError, ValueError):
+            return LINK_LATENCY_MS
 
     def apply_levels(self):
         for key, (mod, *_r) in self.links.items():
