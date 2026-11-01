@@ -1,0 +1,61 @@
+{
+  "Name": "Audio Mixer",
+  "Version": "1.0.0",
+  "Author": "lawsonf",
+  "Description": "Control the Audio Mixer app: mute and adjust channels and mixes, toggle system sounds.",
+  "Icon": "icons/plugin",
+  "Category": "Audio Mixer",
+  "CategoryIcon": "icons/plugin",
+  "SDKVersion": 2,
+  "OS": [{ "Platform": "linux" }],
+  "CodePathLin": "plugin.py",
+  "Software": { "MinimumVersion": "6.4" },
+  "Actions": [
+    {
+      "Name": "Channel",
+      "UUID": "io.github.lawsonf.audiomixer.channel",
+      "Icon": "icons/channel",
+      "Tooltip": "Mute or change the volume of a channel, on the master fader or in one mix.",
+      "PropertyInspectorPath": "pi.html",
+      "Controllers": ["Keypad", "Encoder"],
+      "Encoder": {
+        "layout": "$B1",
+        "Icon": "icons/channel",
+        "TriggerDescription": { "Rotate": "Volume", "Push": "Mute" }
+      },
+      "States": [{ "Image": "icons/state", "Name": "Channel", "ShowTitle": true }]
+    },
+    {
+      "Name": "Mix",
+      "UUID": "io.github.lawsonf.audiomixer.mix",
+      "Icon": "icons/mix",
+      "Tooltip": "Mute or change the volume of a mix (the level sent to its outputs).",
+      "PropertyInspectorPath": "pi.html",
+      "Controllers": ["Keypad", "Encoder"],
+      "Encoder": {
+        "layout": "$B1",
+        "Icon": "icons/mix",
+        "TriggerDescription": { "Rotate": "Volume", "Push": "Mute" }
+      },
+      "States": [{ "Image": "icons/state", "Name": "Mix", "ShowTitle": true }]
+    },
+    {
+      "Name": "System sounds",
+      "UUID": "io.github.lawsonf.audiomixer.system",
+      "Icon": "icons/system",
+      "Tooltip": "Turn the catch-all on or off: all sounds not assigned to a channel go to System.",
+      "PropertyInspectorPath": "pi.html",
+      "Controllers": ["Keypad"],
+      "States": [{ "Image": "icons/state", "Name": "System sounds", "ShowTitle": true }]
+    },
+    {
+      "Name": "Show mixer",
+      "UUID": "io.github.lawsonf.audiomixer.window",
+      "Icon": "icons/window",
+      "Tooltip": "Show or hide the Audio Mixer window (starts the mixer if it is not running).",
+      "PropertyInspectorPath": "pi.html",
+      "Controllers": ["Keypad"],
+      "States": [{ "Image": "icons/state", "Name": "Show mixer", "ShowTitle": true }]
+    }
+  ]
+}

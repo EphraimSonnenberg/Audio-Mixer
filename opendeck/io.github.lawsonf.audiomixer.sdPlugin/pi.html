@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Audio Mixer</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 12px 16px; font: 13px system-ui, sans-serif; background: #2d2d2d; color: #ddd; }
+  .row { display: grid; grid-template-columns: 110px 1fr; gap: 8px; align-items: center; margin: 8px 0; }
+  label { color: #aaa; }
+  select, input { width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 4px; border: 1px solid #555;
+                  background: #1f1f1f; color: #eee; font: inherit; }
+  .note { margin: 10px 0 0; padding: 8px 10px; border-radius: 4px; background: #3a2f2f; color: #f0b4b4; }
+  .hint { margin-top: 12px; color: #888; font-size: 12px; line-height: 1.4; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="offline" class="note" hidden>The Audio Mixer isn't running. Start it, or press the "Show mixer" key, then reopen this panel.</div>
+<div id="form"></div>
+<script>
+let ws, uuid, action, settings = {}, state = null;
+const A = 'io.github.lawsonf.audiomixer.';
+
+function connectElgatoStreamDeckSocket(port, inUUID, registerEvent, info, actionInfo) {
+  uuid = inUUID;
+  const ai = JSON.parse(actionInfo);
+  action = ai.action;
+  settings = (ai.payload && ai.payload.settings) || {};
+  ws = new WebSocket('ws://127.0.0.1:' + port);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ event: registerEvent, uuid: inUUID }));
+    ws.send(JSON.stringify({ event: 'sendToPlugin', action, context: uuid, payload: { request: 'state' } }));
+    render();
+  };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.event === 'sendToPropertyInspector') { state = m.payload.state; render(); }
+    else if (m.event === 'didReceiveSettings') { settings = m.payload.settings || {}; render(); }
+  };
+}
+const connectOpenActionSocket = connectElgatoStreamDeckSocket;
+
+function save(key, value) {
+  settings[key] = value;
+  ws.send(JSON.stringify({ event: 'setSettings', context: uuid, payload: settings }));
+}
+function opts(list, current, extra) {
+  return (extra || []).concat(list).map(([v, t]) =>
+    `<option value="${v}"${v === current ? ' selected' : ''}>${t}</option>`).join('');
+}
+function row(label, control) { return `<div class="row"><label>${label}</label>${control}</div>`; }
+function sel(key, html) { return `<select data-key="${key}">${html}</select>`; }
+
+function render() {
+  const f = document.getElementById('form');
+  document.getElementById('offline').hidden = !!state;
+  const chans = state ? state.channels.map(c => [c.id, c.name]) : [];
+  const mixes = state ? state.mixes.map(m => [m.id, m.name]) : [];
+  let h = '';
+  if (action === A + 'channel') {
+    h += row('Channel', sel('channel', opts(chans, settings.channel, [['', 'Choose…']])));
+    h += row('Applies to', sel('scope', opts(mixes.map(([i, n]) => [i, 'Only in ' + n]),
+         settings.scope || 'master', [['master', 'Channel master (all mixes)']])));
+    h += row('Key press', sel('keyMode', opts([['mute', 'Toggle mute'], ['up', 'Volume up'],
+         ['down', 'Volume down'], ['set', 'Set volume to…'], ['route', 'Send to / remove from mix']],
+         settings.keyMode || 'mute')));
+  } else if (action === A + 'mix') {
+    h += row('Mix', sel('mix', opts(mixes, settings.mix, [['', 'Choose…']])));
+    h += row('Key press', sel('keyMode', opts([['mute', 'Toggle mute'], ['up', 'Volume up'],
+         ['down', 'Volume down'], ['set', 'Set volume to…']], settings.keyMode || 'mute')));
+  } else if (action === A + 'system') {
+    h += row('Key press', sel('mode', opts([['toggle', 'Toggle'], ['on', 'Turn on'], ['off', 'Turn off']],
+         settings.mode || 'toggle')));
+  } else if (action === A + 'window') {
+    h += row('Key press', sel('mode', opts([['toggle', 'Show / hide'], ['show', 'Show'], ['hide', 'Hide']],
+         settings.mode || 'toggle')));
+  }
+  if (action === A + 'channel' || action === A + 'mix') {
+    h += row('Step (%)', `<input type="number" min="1" max="50" data-key="step" value="${settings.step || 5}">`);
+    if ((settings.keyMode || 'mute') === 'set')
+      h += row('Set to (%)', `<input type="number" min="0" max="100" data-key="setTo" value="${settings.setTo ?? 50}">`);
+    h += '<div class="hint">On a dial: turn to change the volume by the step, press to mute.</div>';
+  }
+  f.innerHTML = h;
+  f.querySelectorAll('[data-key]').forEach(el => el.addEventListener('change', () => {
+    const k = el.dataset.key;
+    save(k, el.type === 'number' ? Number(el.value) : el.value);
+    if (k === 'keyMode') render();
+  }));
+}
+render();
+</script>
+</body>
+</html>
