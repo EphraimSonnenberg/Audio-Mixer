@@ -1,0 +1,213 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#0e0f11"><link rel="manifest" href="/manifest.json">
+<title>Audio Mixer Console</title><style>
+:root{--bg:#0e0f11;--panel:#1b1d21;--panel2:#24272c;--edge:#33373e;--fg:#e9eaec;--dim:#8b9098;
+--acc:#35aef5;--red:#ff4d4d;--amber:#ffb340;--grn:#4cd964;--strip:84px}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+html,body{height:100%}body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-serif;
+display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);overflow:hidden}
+header{display:flex;align-items:center;gap:10px;padding:8px 12px;background:#141518;border-bottom:1px solid #000}
+header h1{font-size:14px;letter-spacing:2px;margin:0;font-weight:700}
+.led{width:9px;height:9px;border-radius:50%;background:#511;box-shadow:inset 0 0 2px #000}.led.on{background:var(--grn);box-shadow:0 0 6px var(--grn)}
+#prof{color:var(--dim);font-size:12px;margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.layers{display:flex;gap:6px;padding:8px 12px;overflow-x:auto;background:#121316;border-bottom:1px solid #000;flex:none}
+.layers button{flex:none;background:var(--panel2);color:var(--dim);border:1px solid var(--edge);border-radius:6px;
+padding:7px 12px;font:600 12px system-ui;letter-spacing:.5px}
+.layers button.sel{background:var(--acc);color:#04121c;border-color:var(--acc)}
+main{flex:1;min-height:0;overflow:auto}
+.desk{display:flex;height:100%;min-height:430px}
+.strips{display:flex;overflow-x:auto;flex:1;min-width:0;scroll-snap-type:x proximity;scrollbar-color:#3a3d43 #0e0f11;scrollbar-width:thin}
+.master{display:flex;flex:none;border-left:3px solid #000;background:#16171a;box-shadow:-6px 0 12px rgba(0,0,0,.5)}
+.strip{width:var(--strip);flex:none;display:flex;flex-direction:column;align-items:stretch;gap:6px;padding:8px 6px;
+background:linear-gradient(90deg,#1f2125,#1a1c20 50%,#17191c);border-right:1px solid #000;scroll-snap-align:start}
+.strip.off .fz,.strip.off .readout{opacity:.3}
+.strip.mst{background:linear-gradient(90deg,#24211c,#1d1b18)}
+.lbl{font-size:9px;letter-spacing:1.5px;color:var(--dim);text-align:center}
+.ins{display:flex;flex-direction:column;gap:3px;height:100px;flex:none;overflow:hidden}
+.slot{background:#101113;border:1px solid #2a2d33;border-radius:3px;color:#5d6269;font:600 9px system-ui;
+letter-spacing:.5px;padding:3px 2px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.slot.on{color:#0b1a10;background:var(--grn);border-color:var(--grn);box-shadow:0 0 6px rgba(76,217,100,.45)}
+.slot.more{color:var(--acc);border-style:dashed}
+.btn{border:1px solid #000;border-radius:5px;background:linear-gradient(#3a3d43,#2a2c31);color:#cfd2d6;
+font:700 11px system-ui;letter-spacing:1px;padding:7px 0;box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}
+.btn.mute.on{background:linear-gradient(#ff6b6b,#d63030);color:#200;box-shadow:0 0 10px rgba(255,77,77,.6)}
+.btn.duck.on{background:linear-gradient(#ffc966,#e09520);color:#221400}
+.btn.route{font-size:10px}.btn.route.on{background:linear-gradient(#5cc4ff,#2a8fd0);color:#04121c}
+.fz{flex:1;display:flex;gap:4px;min-height:200px;position:relative}
+.scale{width:18px;position:relative;font-size:8px;color:#6c727a}
+.scale span{position:absolute;right:0;transform:translateY(50%)}
+.meter{width:8px;background:#0a0b0c;border-radius:2px;position:relative;overflow:hidden;box-shadow:inset 0 0 0 1px #000}
+.meter .fill{position:absolute;left:0;right:0;bottom:0;height:0;
+background:linear-gradient(to top,#2ecc55 0%,#2ecc55 65%,#ffd23f 82%,#ff4d4d 96%);background-size:100% var(--h,200px);background-position:bottom}
+.meter .seg{position:absolute;inset:0;background:repeating-linear-gradient(to top,transparent 0 3px,#0a0b0c 3px 4px)}
+.meter .pk{position:absolute;left:0;right:0;height:2px;background:#fff;bottom:0;opacity:.85}
+.fader{flex:1;position:relative;touch-action:none;cursor:ns-resize}
+.fader .track{position:absolute;left:50%;top:6px;bottom:6px;width:6px;margin-left:-3px;background:#050506;
+border-radius:3px;box-shadow:inset 0 1px 2px #000,0 1px 0 rgba(255,255,255,.06)}
+.fader .cap{position:absolute;left:50%;width:38px;height:22px;margin-left:-19px;margin-bottom:-11px;border-radius:3px;
+background:linear-gradient(#5b5f66,#3b3e44 45%,#1c1d20 50%,#3b3e44 55%,#4b4f55);border:1px solid #000;
+box-shadow:0 3px 6px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.2)}
+.fader .cap:after{content:"";position:absolute;left:4px;right:4px;top:10px;height:2px;background:#e9eaec;border-radius:1px}
+.strip.mst .fader .cap:after{background:var(--red)}
+.readout{font:600 11px ui-monospace,monospace;text-align:center;color:var(--acc);background:#08090a;border-radius:3px;
+padding:3px 0;border:1px solid #000}
+.name{font:700 11px system-ui;text-align:center;padding:6px 2px;border-radius:3px;background:#e9eaec;color:#111;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-top:3px solid var(--c,#35aef5)}
+.strip.mst .name{background:#2b2214;color:var(--amber);border-top-color:var(--amber)}
+nav{display:flex;background:#141518;border-top:1px solid #000;padding-bottom:env(safe-area-inset-bottom);flex:none}
+nav button{flex:1;padding:12px 0;background:none;border:0;color:var(--dim);font:600 13px system-ui}nav button.sel{color:var(--acc)}
+.page{padding:12px 14px;max-width:1100px;margin:auto}
+.pads{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}
+.pad{background:linear-gradient(#2a2d33,#1f2125);border:1px solid #000;color:var(--fg);border-radius:10px;min-height:92px;
+padding:10px;text-align:left;font:600 14px system-ui;position:relative;box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}
+.pad.playing{box-shadow:0 0 0 2px var(--acc),0 0 14px rgba(53,174,245,.5)}.pad small{position:absolute;bottom:8px;right:10px;color:var(--dim);font-weight:400}
+.wide{width:100%;text-align:left;padding:12px 14px;margin-bottom:8px;font-size:14px;letter-spacing:0}
+.wide.cur{box-shadow:0 0 0 2px var(--acc)}.stopall{background:linear-gradient(#ff6b6b,#d63030);color:#200;text-align:center}
+h2{font-size:11px;letter-spacing:2px;color:var(--dim);margin:18px 0 8px}
+.sheet{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;justify-content:center;z-index:9}
+.sheet>div{background:var(--panel);width:100%;max-width:520px;border-radius:14px 14px 0 0;padding:14px 14px calc(14px + env(safe-area-inset-bottom));
+max-height:80vh;overflow:auto;border-top:1px solid var(--edge)}
+.sheet h3{margin:0 0 10px;font-size:15px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.grid2 .slot{font-size:12px;padding:12px 6px;letter-spacing:0}
+.empty{color:var(--dim);padding:30px;text-align:center}
+</style></head><body>
+<header><div class="led" id="dot"></div><h1>AUDIO MIXER</h1><span id="prof"></span></header>
+<div class="layers" id="layers"></div>
+<main id="main"></main>
+<nav><button data-t="console" class="sel">Console</button><button data-t="board">Soundboard</button><button data-t="more">Scenes</button></nav>
+<script>
+"use strict";
+let S=null,M={},tab='console',layer='main',drag=0,sheet=null;const peak={};
+const $=s=>document.querySelector(s);
+const send=o=>fetch('/api/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}).catch(()=>{});
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const J=o=>esc(JSON.stringify(o));
+// fader taper: position p (0..1) <-> volume 0..100, with -12 dB at mid travel
+const v2p=v=>Math.sqrt(Math.max(0,v)/100), p2v=p=>Math.round(100*p*p);
+const db=v=>v<=0?'-∞':(20*Math.log10(v/100)).toFixed(1);
+const COLORS=['#35aef5','#4cd964','#ffd23f','#ff9940','#ff6b9d','#b07aff','#3fd0d0','#ff6b6b'];
+const color=i=>COLORS[i%COLORS.length];
+const STD_SHORT={denoise:'NOISE',gate:'GATE',lowcut:'LO CUT',eq:'EQ',deess:'DE-ESS',comp:'COMP',limiter:'LIMIT',loud:'EAR'};
+
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;
+  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('sel',x==b));render()});
+
+function scale(){return '<div class="scale">'+[0,-6,-12,-20,-30,-40].map(d=>`<span style="bottom:${v2p(100*10**(d/20))*100}%">${d}</span>`).join('')+'</div>'}
+function fader(v,cmd){return `<div class="fader" data-cmd='${J(cmd)}' data-v="${v}"><div class="track"></div>
+<div class="cap" style="bottom:calc(6px + (100% - 12px)*${v2p(v)})"></div></div>`}
+function meter(id){return id?`<div class="meter" data-meter="${esc(id)}"><div class="fill"></div><div class="seg"></div><div class="pk"></div></div>`:''}
+function inserts(id){const f=S.fx[id];if(!f)return '<div class="ins"></div>';
+  const on=Object.entries(f.std).filter(([k,v])=>v.on).map(([k,v])=>STD_SHORT[k]||v.title.toUpperCase())
+    .concat(f.rack.filter(r=>r.on).map(r=>r.title.toUpperCase()));
+  const shown=on.slice(0,3).map(t=>`<div class="slot on">${esc(t)}</div>`).join('');
+  return `<div class="ins">${shown}${on.length>3?`<div class="slot on">+${on.length-3}</div>`:''}<div class="slot more" data-sheet="${esc(id)}">FX ▾</div></div>`}
+
+function chStrip(c,i){
+  let v,mu,cmdBase,routed=true;
+  if(layer=='main'){v=c.vol;mu=c.mute;cmdBase={cmd:'channel',id:c.id}}
+  else{const e=S.cells[layer][c.id];v=e.vol;mu=e.mute;routed=e.on;cmdBase={cmd:'channel',id:c.id,mix:layer}}
+  const duck=S.duck[c.id];
+  return `<div class="strip ${routed?'':'off'}" style="--c:${color(i)}">
+  ${inserts(c.id)}
+  ${layer=='main'?`<button class="btn duck ${duck?'on':''}" data-cmd='${J({cmd:'duck',id:c.id,on:'toggle'})}'>DUCK</button>`
+    :`<button class="btn route ${routed?'on':''}" data-cmd='${J({...cmdBase,on:'toggle'})}'>${routed?'SEND ON':'SEND OFF'}</button>`}
+  <div class="fz">${scale()}${meter(c.id)}${fader(v,cmdBase)}</div>
+  <div class="readout">${db(v)}</div>
+  <button class="btn mute ${mu?'on':''}" data-cmd='${J({...cmdBase,mute:'toggle'})}'>MUTE</button>
+  <div class="name">${esc(c.name)}</div></div>`}
+
+function mixStrip(x,nameOverride){
+  return `<div class="strip mst">${inserts(x.id)}
+  <button class="btn route ${layer==x.id?'on':''}" data-layer="${esc(x.id)}">${layer==x.id?'SELECTED':'SELECT'}</button>
+  <div class="fz">${scale()}${fader(x.vol,{cmd:'mix',id:x.id})}</div>
+  <div class="readout">${db(x.vol)}</div>
+  <button class="btn mute ${x.mute?'on':''}" data-cmd='${J({cmd:'mix',id:x.id,mute:'toggle'})}'>MUTE</button>
+  <div class="name">${esc(nameOverride||x.name)}</div></div>`}
+
+function outStrip(x,o){
+  return `<div class="strip"><div class="ins"><div class="lbl">OUTPUT</div></div>
+  <div class="fz">${scale()}${fader(o.vol,{cmd:'output',mix:x.id,output:o.sink})}</div>
+  <div class="readout">${db(o.vol)}</div>
+  <button class="btn mute ${o.mute?'on':''}" data-cmd='${J({cmd:'output',mix:x.id,output:o.sink,mute:'toggle'})}'>MUTE</button>
+  <div class="name" title="${esc(o.name)}">${esc(o.name)}</div></div>`}
+
+function renderLayers(){
+  const L=$('#layers');if(tab!='console'){L.style.display='none';return}L.style.display='';
+  if(layer!='main'&&!S.mixes.some(x=>x.id==layer))layer='main';
+  L.innerHTML=`<button class="${layer=='main'?'sel':''}" data-layer="main">CHANNELS</button>`+
+    S.mixes.map(x=>`<button class="${layer==x.id?'sel':''}" data-layer="${esc(x.id)}">MIX · ${esc(x.name).toUpperCase()}</button>`).join('')}
+
+function render(){
+  if(!S||drag)return;
+  $('#prof').textContent=S.profile?('Scene: '+S.profile):'';
+  renderLayers();
+  const m=$('#main');
+  if(tab=='console'){
+    let master;
+    if(layer=='main')master=S.mixes.map(x=>mixStrip(x)).join('');
+    else{const x=S.mixes.find(y=>y.id==layer);master=x.outs.map(o=>outStrip(x,o)).join('')+mixStrip(x,x.name+' MASTER')}
+    m.innerHTML=`<div class="desk"><div class="strips">${S.channels.map(chStrip).join('')||'<div class="empty">No channels</div>'}</div>
+      <div class="master">${master}</div></div>`;
+  }else if(tab=='board'){
+    m.innerHTML=`<div class="page"><button class="btn wide stopall" data-cmd='${J({cmd:'soundboard',action:'stop_all'})}'>STOP ALL</button>
+    <div class="pads">${S.soundboard.map(p=>`<button class="pad ${p.playing?'playing':''}" data-cmd='${J({cmd:'soundboard',action:'play',id:p.id})}'>${esc(p.name)}<small>${esc(p.id)}</small></button>`).join('')}</div>
+    ${S.soundboard.length?'':'<div class="empty">No sounds yet. Add them on the computer.</div>'}</div>`;
+  }else{
+    m.innerHTML=`<div class="page"><h2>SCENES (PROFILES)</h2>${S.profiles.map(p=>`<button class="btn wide ${p==S.profile?'cur':''}" data-cmd='${J({cmd:'profile',name:p})}'>${esc(p)}</button>`).join('')||'<div class="empty">No profiles saved yet.</div>'}</div>`;
+  }
+  if(sheet)openSheet(sheet);
+  sizeMeters();
+}
+
+function openSheet(id){
+  sheet=id;const f=S.fx[id];const o=S.channels.concat(S.mixes).find(x=>x.id==id);
+  let el=$('.sheet');if(!f||!o){if(el)el.remove();sheet=null;return}
+  if(!el){el=document.createElement('div');el.className='sheet';document.body.appendChild(el);
+    el.addEventListener('click',e=>{if(e.target==el){el.remove();sheet=null}})}
+  el.innerHTML=`<div><h3>${esc(o.name)} · inserts</h3><div class="grid2">`+
+    Object.entries(f.std).map(([k,v])=>`<button class="slot ${v.on?'on':''}" data-cmd='${J({cmd:'fx',target:id,effect:k,on:'toggle'})}'>${esc(v.title)}</button>`).join('')+
+    `</div>${f.rack.length?'<h2>CREATIVE RACK</h2><div class="grid2">'+f.rack.map(r=>`<button class="slot ${r.on?'on':''}" data-cmd='${J({cmd:'fx',target:id,rack:r.uid,on:'toggle'})}'>${esc(r.title)}</button>`).join('')+'</div>':''}
+    <button class="btn wide" style="margin-top:14px;text-align:center" data-close>DONE</button></div>`;
+}
+
+document.addEventListener('click',e=>{
+  const c=e.target.closest('[data-close]');if(c){$('.sheet')?.remove();sheet=null;return}
+  const s=e.target.closest('[data-sheet]');if(s){openSheet(s.dataset.sheet);return}
+  const l=e.target.closest('[data-layer]');if(l){layer=l.dataset.layer;render();return}
+  const b=e.target.closest('[data-cmd]:not(.fader)');if(b)send(JSON.parse(b.dataset.cmd))});
+
+// faders: drag anywhere on the strip's fader lane; double-tap = unity (0 dB)
+let pend=null,timer=null,lastTap=0;
+function setFader(fd,v){fd.dataset.v=v;fd.querySelector('.cap').style.bottom=`calc(6px + (100% - 12px)*${v2p(v)})`;
+  const ro=fd.closest('.strip').querySelector('.readout');if(ro)ro.textContent=db(v)}
+function queue(fd,v){pend=[fd,v];if(timer)return;flush();timer=setInterval(()=>{if(!pend){clearInterval(timer);timer=null;return}flush()},50)}
+function flush(){if(!pend)return;const[fd,v]=pend;pend=null;send(Object.assign(JSON.parse(fd.dataset.cmd),{vol:v}))}
+document.addEventListener('pointerdown',e=>{
+  const fd=e.target.closest('.fader');if(!fd)return;e.preventDefault();
+  const now=Date.now();if(now-lastTap<300){lastTap=0;setFader(fd,100);queue(fd,100);return}lastTap=now;
+  fd.setPointerCapture(e.pointerId);drag=1;
+  const r=fd.getBoundingClientRect(),cap=fd.querySelector('.cap').getBoundingClientRect();
+  const onCap=e.clientY>=cap.top-6&&e.clientY<=cap.bottom+6;
+  const y0=e.clientY,p0=v2p(+fd.dataset.v),span=r.height-12;
+  const move=ev=>{let p=onCap?p0+(y0-ev.clientY)/span:(r.bottom-6-ev.clientY)/span;
+    const v=p2v(Math.min(1,Math.max(0,p)));if(v!=+fd.dataset.v){setFader(fd,v);queue(fd,v)}};
+  if(!onCap)move(e);
+  const up=()=>{fd.removeEventListener('pointermove',move);fd.removeEventListener('pointerup',up);fd.removeEventListener('pointercancel',up);
+    setTimeout(()=>{drag=0;render()},250)};
+  fd.addEventListener('pointermove',move);fd.addEventListener('pointerup',up);fd.addEventListener('pointercancel',up)});
+
+function sizeMeters(){document.querySelectorAll('.meter').forEach(m=>m.style.setProperty('--h',m.clientHeight+'px'));drawMeters()}
+function drawMeters(){const now=performance.now();
+  document.querySelectorAll('[data-meter]').forEach(el=>{const id=el.dataset.meter,v=M[id]||0;
+    const p=peak[id]||{v:0,t:0};if(v>=p.v||now-p.t>1200){p.v=v;p.t=now}else p.v=Math.max(v,p.v-0.004);peak[id]=p;
+    el.querySelector('.fill').style.height=(v*100)+'%';el.querySelector('.pk').style.bottom=`calc(${p.v*100}% - 2px)`;
+    el.querySelector('.pk').style.opacity=p.v>0.02?.85:0})}
+addEventListener('resize',sizeMeters);
+
+function connect(){const es=new EventSource('/api/events');
+  es.addEventListener('state',e=>{S=JSON.parse(e.data);$('#dot').className='led on';render()});
+  es.addEventListener('meters',e=>{M=JSON.parse(e.data);drawMeters()});
+  es.onerror=()=>{$('#dot').className='led';es.close();setTimeout(connect,1500)}}
+connect();
+</script></body></html>

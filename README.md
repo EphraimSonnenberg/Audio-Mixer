@@ -11,15 +11,76 @@ No special hardware needed.
 - **System tray**: closing the window keeps the mixer running in the tray.
 - **OpenDeck plugin** (`opendeck/`): control the mixer from a real Stream Deck through [OpenDeck](https://github.com/nekename/OpenDeck).
 
-Audio passes through untouched. At 100% faders the signal is bit-identical; the graph stays at the server's sample rate in 32-bit float. The added delay is about 9 ms (5 ms loopback buffers). Set `"latency_ms"` in the config to change it: 3 gives about 4 ms but runs PipeWire at a 1 ms period.
+Audio passes through untouched. At 100% faders with no effects on, the signal is bit-identical; the graph stays at the server's sample rate in 32-bit float. The added delay is about 9 ms (5 ms loopback buffers). Change it under **Settings ▸ Latency** (3 ms buffers give about 4 ms but run PipeWire at a 1 ms period).
+
+### Effects
+
+Every channel has an effect chain (the **Effects** tab when you click a channel). Every mix has one too, for its device outputs:
+
+| Effect | Channels | Mixes | |
+|---|---|---|---|
+| Noise suppression | ✓ | | RNNoise, at full strength (adds 10 ms while on) |
+| Noise gate | ✓ | | threshold, reduction, attack, hold, release |
+| Low cut | ✓ | | 24 dB/octave high-pass |
+| Equalizer | ✓ | ✓ | **Simple** (bass / mid / treble) or **Advanced**: 10 parametric bands on a draggable response curve, with presets |
+| De-esser | ✓ | | split-band, so only the sibilant band is turned down |
+| Compressor | ✓ | ✓ | ratio, knee, attack/release, automatic makeup gain |
+| Creative Rack | ✓ | | see below |
+| Limiter | ✓ | ✓ | 5 ms look-ahead, adjustable ceiling |
+| Ear protection | app channels | ✓ | BS.1770 (LUFS) loudness limiter: a sudden loud video can't blast your ears |
+
+The **Creative** tab is a pedalboard of fourteen effects: Creative EQ (an amp-style Gain / Bass / Middle / Treble / Presence / Master stack), Overdrive, Tape Saturator, Bitcrusher, Chorus, Flanger, Phaser, Tremolo, Ring Modulator, Envelope Filter (auto-wah), Pitch Shifter, Delay (damping, ping-pong), Reverse Delay and Reverb (size, damping, predelay). Add only the units you need. Drag a unit by its grip to change the order the audio takes through them. Each unit has its own power switch and RESET. Save a whole rack as a preset and load it onto any other channel. Presets live in `~/.config/audio-mixer/rack-presets.json` and import/export as files. "Open the rack in its own window" gives you a window to keep next to whatever you play into.
+
+How it works: the effects are a small C plugin (`fx/amx_fx.c`, built automatically into `fx/amx_fx.so` on first start; needs `gcc`). Each channel with effects runs it in its own PipeWire filter-chain, which publishes the processed audio as a source named `amx_fx_…`. Knob moves are applied live. Only adding, removing or reordering units (or switching a channel's first / last effect on or off) rebuilds that channel's chain.
+
+### Ducking
+
+In a channel's **Channel settings**, turn on Ducking and choose which channels trigger it (e.g. duck *Music* while *Mic* or *Chat* is active). You can set how far it turns down, the trigger level and the hold time.
+
+### Soundboard
+
+The **Soundboard** page holds pads with a name, a waveform, play/stop and a stable 4-digit id. Right-click a pad (or ⋯) to trim it on the waveform and set its own volume. Pressing a pad again layers another copy instead of cutting the first one off. The whole board plays into one channel you choose (or a new "Soundboard" channel), so the mixer decides who hears it: your headphones, the stream, or the microphone mix your friends hear. Sounds are copied into `~/.config/audio-mixer/sounds/`, and the whole board exports and imports as one `.zip` from **Settings ▸ Backups**. Needs `ffmpeg` for anything other than 16-bit WAV.
+
+### Web Companion
+
+**Settings ▸ Web Companion** serves the mixer to any phone or tablet on your network (port 8787 by default) as a mixing console:
+- a channel strip per channel, with insert slots that light up for active effects (tap **FX** to switch any effect or rack unit), DUCK, an LED meter with peak hold, a long-throw fader with a dB scale and readout (double-tap for 0 dB), MUTE and a colour-coded name strip
+- layer buttons along the top flip the faders between the channel masters and each mix's sends, the way an aux layer works on a desk; in a mix layer each strip has SEND ON/OFF
+- a master section on the right with each mix's master fader, or, inside a mix layer, that mix's master plus a fader and mute for every output device
+- soundboard pads, and scenes (profiles)
+
+Changes appear both ways within a frame or two. The page is `web/companion.html`. It is off by default and can start with the mixer. **There is no password**: anyone who can reach the port can change your mixer, so leave it off on networks you don't control.
+
+### Profiles
+
+A profile is a whole mixer setup: channels, levels, mutes, routing and effects. Save, rename, switch, delete, import and export them in **Settings ▸ Profiles**. Switching keeps the edits you made to the profile you leave.
+
+### More
+
+- **Per-output levels**: each output device of a mix has its own volume and mute (headphones and speakers at once, at different levels).
+- **Instrument tuner** (sidebar ▸ Tuner): any input, chromatic or guitar / bass / ukulele / violin string modes (auto or a fixed string), adjustable concert pitch. Needs `numpy`.
+- **MIDI instrument**: a virtual channel can host a FluidSynth SoundFont (`.sf2`) that every MIDI keyboard plays (Channel settings ▸ MIDI instrument). Needs `fluidsynth` and a SoundFont.
+- **Deck keys** for all of this: play / stop a sound, switch an effect on or off, toggle ducking, switch profile, open the tuner.
+- **Command line** for keybinds and scripts, talking to the running mixer:
+
+  ```sh
+  python3 audio_mixer.py ctl play 4821          # soundboard (also: stop, toggle, stop-all)
+  python3 audio_mixer.py ctl fx Mic denoise     # toggle (or: on / off); rack units by name: fx Mic reverb
+  python3 audio_mixer.py ctl fx-set Mic gate Threshold -50
+  python3 audio_mixer.py ctl profile Streaming
+  python3 audio_mixer.py ctl vol Music -5       # also: mute, mix-vol, mix-mute, duck, tuner, state
+  ```
+
+The feature set follows [Waveline](https://github.com/Nakildias/Waveline). This is an independent implementation; no Waveline code is used.
 
 ## Requirements
 
 - PipeWire with `pipewire-pulse` (or PulseAudio), plus `pactl` and `parec`
 - Python 3.10+, PyGObject, GTK 4, libadwaita 1.5+, pycairo
-- Optional: KDE Plasma (KWin), for the deck's always-on-top and hide-from-taskbar options; `nvidia-smi` for NVIDIA GPU stats
+- For effects: `gcc` and `rnnoise` (without rnnoise everything except noise suppression works)
+- Optional: `ffmpeg` (soundboard formats), `numpy` (tuner), `fluidsynth` (MIDI instruments), KDE Plasma (KWin) for the deck's always-on-top and hide-from-taskbar options, `nvidia-smi` for NVIDIA GPU stats
 
-Arch / CachyOS: `sudo pacman -S python-gobject gtk4 libadwaita python-cairo libpulse`
+Arch / CachyOS: `sudo pacman -S python-gobject gtk4 libadwaita python-cairo libpulse gcc rnnoise ffmpeg python-numpy fluidsynth`
 
 ## Run
 

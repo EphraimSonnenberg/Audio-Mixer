@@ -72,6 +72,24 @@ function render() {
   } else if (action === A + 'system') {
     h += row('Key press', sel('mode', opts([['toggle', 'Toggle'], ['on', 'Turn on'], ['off', 'Turn off']],
          settings.mode || 'toggle')));
+  } else if (action === A + 'sound') {
+    const snds = state ? (state.soundboard || []).map(x => [x.id, x.name + '  (' + x.id + ')']) : [];
+    h += row('Sound', sel('sound', opts(snds, settings.sound, [['', 'Choose…']])));
+    h += row('Key press', sel('mode', opts([['play', 'Play (layers on repeat)'], ['toggle', 'Play / stop'],
+         ['stop', 'Stop'], ['stop_all', 'Stop all sounds']], settings.mode || 'play')));
+  } else if (action === A + 'fx') {
+    const objs = state ? state.channels.concat(state.mixes.map(m => Object.assign({}, m, {name: m.name + ' (mix)'}))) : [];
+    h += row('On', sel('target', opts(objs.map(o => [o.id, o.name]), settings.target, [['', 'Choose…']])));
+    const f = state && state.fx ? state.fx[settings.target] : null;
+    if (f) {
+      const effs = Object.entries(f.std).map(([k, v]) => [k, v.title])
+        .concat([...new Map(f.rack.map(r => ['rack:' + r.type, 'Rack: ' + r.title])).entries()]);
+      h += row('Effect', sel('effect', opts(effs, settings.effect, [['', 'Choose…']])));
+    }
+  } else if (action === A + 'profile') {
+    const profs = state ? (state.profiles || []).map(p => [p, p]) : [];
+    h += row('Profile', sel('profile', opts(profs, settings.profile, [['', 'Choose…']])));
+    if (state && !profs.length) h += '<div class="hint">Save a profile in the mixer\'s Settings page first.</div>';
   } else if (action === A + 'window') {
     h += row('Key press', sel('mode', opts([['toggle', 'Show / hide'], ['show', 'Show'], ['hide', 'Hide']],
          settings.mode || 'toggle')));
@@ -86,7 +104,7 @@ function render() {
   f.querySelectorAll('[data-key]').forEach(el => el.addEventListener('change', () => {
     const k = el.dataset.key;
     save(k, el.type === 'number' ? Number(el.value) : el.value);
-    if (k === 'keyMode') render();
+    if (k === 'keyMode' || k === 'target') render();
   }));
 }
 render();
