@@ -22,6 +22,7 @@ import time
 PLUGIN = "io.github.lawsonf.audiomixer"
 A_CHANNEL, A_MIX = f"{PLUGIN}.channel", f"{PLUGIN}.mix"
 A_SYSTEM, A_WINDOW = f"{PLUGIN}.system", f"{PLUGIN}.window"
+A_SOUND, A_FX, A_PROFILE = f"{PLUGIN}.sound", f"{PLUGIN}.fx", f"{PLUGIN}.profile"
 SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "audio-mixer.sock")
 BLUE, GREY, RED = (0.208, 0.682, 0.961), (0.55, 0.55, 0.55), (1.0, 0.42, 0.42)
 
@@ -271,6 +272,30 @@ class Plugin:
             return {"title": f"{sysch['name'] if sysch else 'System'}\n{'ON' if on else 'OFF'}",
                     "image": dict(vol=None, on=bool(on), muted=False, waves=3 if on else 0),
                     "feedback": None}
+        if act == A_SOUND:
+            snd = find(st.get("soundboard"), s.get("sound"))
+            if (s.get("mode") or "play") == "stop_all":
+                return {"title": "Stop all\nsounds", "image": dict(vol=None, on=True), "feedback": None}
+            if not snd:
+                return {"title": "Pick\na sound", "image": dict(vol=None, on=False), "feedback": None}
+            return {"title": f"{snd['name']}\n{'playing' if snd['playing'] else snd['id']}",
+                    "image": dict(vol=None, on=True, waves=3 if snd["playing"] else 1), "feedback": None}
+        if act == A_FX:
+            f = (st.get("fx") or {}).get(s.get("target")) or {}
+            eff = s.get("effect") or ""
+            if eff.startswith("rack:"):
+                u = next((u for u in f.get("rack", []) if u["type"] == eff[5:]), None)
+                title, on = (u["title"], u["on"]) if u else ("Pick", False)
+            else:
+                e = (f.get("std") or {}).get(eff)
+                title, on = (e["title"], e["on"]) if e else ("Pick", False)
+            return {"title": f"{title}\n{'ON' if on else 'OFF'}",
+                    "image": dict(vol=None, on=on, muted=False, waves=3 if on else 0), "feedback": None}
+        if act == A_PROFILE:
+            name = s.get("profile") or ""
+            cur = bool(name) and name == st.get("profile")
+            return {"title": f"{name or 'Pick'}\n{'current' if cur else 'profile'}",
+                    "image": dict(vol=None, on=cur), "feedback": None}
         if act == A_MIX:
             m = find(st["mixes"], s.get("mix"))
             if not m:
@@ -330,6 +355,19 @@ class Plugin:
         if act == A_SYSTEM:
             m = s.get("mode") or "toggle"
             return self.mixer.send({"cmd": "system", "enable": "toggle" if m == "toggle" else m == "on"})
+        if act == A_SOUND:
+            mode = s.get("mode") or "play"
+            if mode != "stop_all" and not s.get("sound"):
+                return False
+            return self.mixer.send({"cmd": "soundboard", "action": mode, "id": s.get("sound")})
+        if act == A_FX:
+            eff = s.get("effect") or ""
+            if not s.get("target") or not eff:
+                return False
+            sel = {"rack": eff[5:]} if eff.startswith("rack:") else {"effect": eff}
+            return self.mixer.send({"cmd": "fx", "target": s["target"], "on": "toggle", **sel})
+        if act == A_PROFILE:
+            return bool(s.get("profile")) and self.mixer.send({"cmd": "profile", "name": s["profile"]})
         target = s.get("mix") if act == A_MIX else s.get("channel")
         if not target:       # nothing chosen in the settings panel yet
             return False

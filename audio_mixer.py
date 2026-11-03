@@ -32,6 +32,10 @@ gi.require_version("Adw", "1")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import amx_effects as fxm  # noqa: E402
+import amx_extras as ext  # noqa: E402
+
 APP_ID = "io.github.lawsonf.AudioMixer"
 CONF = os.environ.get("AMX_CONFIG") or os.path.join(
     GLib.get_user_config_dir(), "audio-mixer", "config.json")
@@ -42,6 +46,7 @@ FULL = 65536  # pulse "100%"
 # (5 ms -> 64 frames), and the whole graph follows, so going lower raises the risk of crackles in
 # busy apps. Override with "latency_ms" in config.json (then restart the mixer).
 LINK_LATENCY_MS = 5
+LINK_SETTLE = 0.4     # s a new loopback is held muted (it starts with a burst of garbage)
 
 
 def pactl(*args, js=False):
@@ -342,7 +347,17 @@ class Engine:
         self._prev_default = None   # the user's real default output, restored on quit
         self._prev_default_src = None   # ... and default microphone
         self.recorders_raw, self.default_source = [], None
+        self.duck = {}        # ch_id -> current ducking factor (1.0 = not ducked)
+        # PipeWire's loopback plays a burst of uninitialised memory when it starts (a loud pop),
+        # so every new link starts muted and is unmuted once settled; a link being replaced keeps
+        # playing until its replacement is live (make-before-break, no gap).
+        self.fresh = {}       # module id -> creation time (held muted for LINK_SETTLE seconds)
+        self.retiring = {}    # module id -> (time to mute and unload it, its source)
+        self._settle_timer = None
         self.cleanup_stale()
+        self.fx = fxm.FxHost()
+        self.fx_src = {}      # fid -> source name of a running effect chain
+        self.instruments = ext.Instruments()   # FluidSynth per channel with a MIDI instrument
 
     def cleanup_stale(self):
         # the json listing has no module ids, so use the short format: "<id>\t<name>\t<args>"
@@ -384,6 +399,9 @@ class Engine:
             if i.get("owner_module") not in (None, "", "n/a"):
                 continue
             p = i.get("properties") or {}
+            if (p.get("application.name") or "").startswith("amx-") or \
+                    p.get("application.process.id") in self.instruments.pids():   # our soundboard / synths
+                continue
             out.append({"idx": i["index"],
                         "name": p.get("application.name") or p.get("media.name") or "Unknown",
                         "media": p.get("media.name") or "",
@@ -531,14 +549,17 @@ class Engine:
         c, ch = self.cell(mix, ch), self.chan(ch)
         if c["mute"] or ch["mute"] or not c["on"]:
             return 0.0
-        return c["vol"] / 100 * ch["vol"] / 100
+        return c["vol"] / 100 * ch["vol"] / 100 * self.duck.get(ch["id"], 1.0)
 
     def meter_sources(self):
         names = {s["name"] for s in self.sinks}
         srcs = {s["name"] for s in self.sources}
         out = {}
         for ch in self.cfg["channels"]:
-            if ch["type"] == "virtual" and f"amx_ch_{ch['id']}" in names:
+            fsrc = self.fx_src.get(f"c{ch['id']}")
+            if fsrc and fsrc in srcs:                  # meter what the effects put out
+                out[ch["id"]] = fsrc
+            elif ch["type"] == "virtual" and f"amx_ch_{ch['id']}" in names:
                 out[ch["id"]] = f"amx_ch_{ch['id']}.monitor"
             elif ch["type"] == "hw" and ch["source"] in srcs:
                 out[ch["id"]] = ch["source"]
@@ -578,27 +599,6 @@ class Engine:
         want_mics = {("mic", m["id"]): (f"amx_mic_{m['id']}", f"{m['name']} (mic)")
                      for m in cfg["mixes"] if "mic" in m["outputs"]}
 
-        want_links = {}
-        for m in cfg["mixes"]:
-            bus = f"amx_mix_{m['id']}"
-            for ch in cfg["channels"]:
-                if not self.cell(m, ch)["on"]:
-                    continue
-                if ch["type"] == "virtual":
-                    src, ok = f"amx_ch_{ch['id']}.monitor", True
-                else:
-                    src = ch["source"]
-                    ok = src in src_names
-                if ok:
-                    want_links[("c", m["id"], ch["id"])] = (src, bus)
-            for out in m["outputs"]:
-                if out in hw_sink_names:
-                    want_links[("o", m["id"], out)] = (f"{bus}.monitor", out)
-
-        for key, (mid, _t, src, sink) in list(self.links.items()):
-            if want_links.get(key) != (src, sink):
-                self._unload(mid)
-                del self.links[key]
         changed = False
         for key, (mid, _t) in list(self.sink_mods.items()):
             if key not in want_sinks and key not in want_mics:
@@ -633,26 +633,184 @@ class Engine:
         if mic_made:
             self.refresh()
 
+        # effect chains sit between a channel (or a mix bus) and the loopbacks that carry it
+        self.fx_src = self.sync_fx(sink_names, {s["name"] for s in self.sources})
+        src_names = {s["name"] for s in self.sources}
+
+        want_links = {}
+        for m in cfg["mixes"]:
+            bus = f"amx_mix_{m['id']}"
+            for ch in cfg["channels"]:
+                if not self.cell(m, ch)["on"]:
+                    continue
+                fsrc = self.fx_src.get(f"c{ch['id']}")
+                if fsrc:
+                    src, ok = fsrc, True
+                elif ch["type"] == "virtual":
+                    src, ok = f"amx_ch_{ch['id']}.monitor", True
+                else:
+                    src = ch["source"]
+                    ok = src in src_names
+                if ok:
+                    want_links[("c", m["id"], ch["id"])] = (src, bus)
+            out_src = self.fx_src.get(f"m{m['id']}") or f"{bus}.monitor"
+            for out in m["outputs"]:
+                if out in hw_sink_names:
+                    want_links[("o", m["id"], out)] = (out_src, out)
+
+        now = time.time()
+        for key, (mid, _t, src, sink) in list(self.links.items()):
+            if want_links.get(key) != (src, sink):
+                del self.links[key]
+                # replaced: keep playing until the new link is live; removed: fade out now
+                if key in want_links:
+                    self.retiring[mid] = (now + LINK_SETTLE, src)
+                else:
+                    self._mute_module(mid)
+                    self.retiring[mid] = (now, src)
+
         created = False
         for key, (src, sink) in want_links.items():
             if key in self.links or sink not in sink_names:
                 continue
             if src.endswith(".monitor") and src[:-8] not in sink_names:
                 continue
-            out = pactl("load-module", "module-loopback", f"source={src}", f"sink={sink}",
-                        f"latency_msec={self.link_latency()}", "source_dont_move=true",
-                        "sink_dont_move=true")
-            if out and out.isdigit():
-                self.links[key] = (int(out), now, src, sink)
+            if src.startswith("amx_fx_") and src not in src_names:
+                continue
+            mid = self._new_link(src, sink)
+            if mid is not None:
+                self.links[key] = (mid, now, src, sink)
                 created = True
         if created:
             time.sleep(0.15)
             self.refresh()
         self.apply_levels()
+        self._schedule_settle()
+        self.instruments.sync(cfg["channels"], sink_names)
         self.apply_system_default(sink_names)
         self.apply_default_mic()
         self.enforce_app_rules(sink_names)
         self.enforce_rec_rules()
+
+    # ---- effects
+    def fx_wanted(self):
+        """fid -> chain description for every channel / mix whose effects are on."""
+        out = {}
+        for ch in self.cfg["channels"]:
+            if fxm.active(ch):
+                virt = ch["type"] == "virtual"
+                nds = fxm.nodes(ch)
+                out[f"c{ch['id']}"] = {"nodes": nds, "shape": fxm.shape(ch), "capture_sink": virt,
+                                       "target": f"amx_ch_{ch['id']}" if virt else ch["source"],
+                                       "desc": ch["name"]}
+        for m in self.cfg["mixes"]:
+            if fxm.active(m) and any(o != "mic" for o in m["outputs"]):
+                out[f"m{m['id']}"] = {"nodes": fxm.nodes(m), "shape": fxm.shape(m), "capture_sink": True,
+                                      "target": f"amx_mix_{m['id']}", "desc": m["name"]}
+        return out
+
+    def sync_fx(self, sink_names, src_names):
+        wanted = {fid: w for fid, w in self.fx_wanted().items()
+                  if w["target"] in (sink_names if w["capture_sink"] else src_names)}
+        started = self.fx.sync(wanted)
+        if started:                      # wait for the new chains' sources before linking them
+            names = {self.fx.source(fid) for fid in started}
+            deadline = time.time() + 2.5
+            while time.time() < deadline:
+                have = {ln.split("\t")[1] for ln in (pactl("list", "short", "sources") or "").splitlines()
+                        if ln.count("\t") >= 1}
+                if names <= have:
+                    break
+                time.sleep(0.05)
+            self.refresh()
+        have = {s["name"] for s in self.sources}
+        return {fid: self.fx.source(fid) for fid in wanted
+                if self.fx.running(fid) and self.fx.source(fid) in have}
+
+    # ---- links (loopbacks)
+    def _new_link(self, src, sink):
+        out = pactl("load-module", "module-loopback", f"source={src}", f"sink={sink}",
+                    f"latency_msec={self.link_latency()}", "source_dont_move=true",
+                    "sink_dont_move=true")
+        if not (out and out.isdigit()):
+            return None
+        mid = int(out)
+        self.fresh[mid] = time.time()
+        for _ in range(20):                       # mute it before it starts streaming
+            if self._mute_module(mid):
+                break
+            time.sleep(0.005)
+        return mid
+
+    @staticmethod
+    def _mute_module(mid, mute=True):
+        """Mute the sink input that loopback module `mid` owns. False if it isn't there yet."""
+        for i in pactl("list", "sink-inputs", js=True) or []:
+            if str(i.get("owner_module")) == str(mid):
+                pactl("set-sink-input-mute", i["index"], int(mute))
+                return True
+        return False
+
+    def _schedule_settle(self):
+        if self._settle_timer is None and (self.fresh or self.retiring):
+            self._settle_timer = GLib.timeout_add(int(LINK_SETTLE * 1000) + 30, self._settle)
+
+    def _settle(self):
+        """Unmute settled new links, then mute and unload the links they replace."""
+        self._settle_timer = None
+        now = time.time()
+        self.fresh = {m: t for m, t in self.fresh.items() if now - t < LINK_SETTLE}
+        self.refresh()
+        due = [m for m, (t, _s) in self.retiring.items() if t <= now + 0.01]
+        old = [i["index"] for i in self.inputs if str(i.get("owner_module")) in {str(m) for m in due}]
+        self.apply_levels()                      # unmutes the settled new links ...
+        for ix in old:                           # ... and the links they replace go quiet right after
+            pactl("set-sink-input-mute", ix, 1)
+        if due:
+            def unload():
+                for m in due:
+                    self._unload(m)
+                    self.retiring.pop(m, None)
+                self.fx.reap({src for _m, _t, src, _s in self.links.values()} |
+                             {src for _t, src in self.retiring.values()})
+                self._schedule_settle()
+                return False
+            GLib.timeout_add(60, unload)
+        else:
+            self._schedule_settle()
+        return False
+
+    def apply_fx(self):
+        """Apply effect edits: live values when the chains keep their shape, else rebuild.
+        Returns True when the graph was rebuilt."""
+        wanted = self.fx_wanted()
+        procs = self.fx.procs
+        if set(wanted) != set(procs) or any(procs[f]["shape"] != w["shape"] or not self.fx.running(f)
+                                            for f, w in wanted.items()):
+            self.reconcile()
+            return True
+        ids = self._fx_node_ids()
+        if any(f not in ids for f in wanted):
+            self.recorders_raw = pactl("list", "source-outputs", js=True) or []
+            ids = self._fx_node_ids()
+        for fid, w in wanted.items():
+            self.fx.push(fid, {f"{n}:{k}": v for n, _l, c in w["nodes"] for k, v in c.items()}, ids.get(fid))
+        return False
+
+    def _fx_node_ids(self):
+        by_name = {(o.get("properties") or {}).get("node.name"): (o.get("properties") or {}).get("object.id")
+                   for o in self.recorders_raw}
+        return {fid: by_name[self.fx.capture_name(fid)] for fid in self.fx.procs
+                if self.fx.capture_name(fid) in by_name}
+
+    def relink(self):
+        """Drop every loopback and build them again (e.g. after a latency change)."""
+        for mid, *_ in list(self.links.values()):
+            self._mute_module(mid)
+            self._unload(mid)
+        self.links.clear()
+        time.sleep(0.1)
+        self.reconcile()
 
     def link_latency(self):
         try:
@@ -672,9 +830,12 @@ class Engine:
                     continue
                 want_gain = self.gain(mix, ch)
                 want_mute = bool(self.cell(mix, ch)["mute"] or ch["mute"])
-            else:
-                want_gain = 0.0 if mix["mute"] else mix["vol"] / 100
-                want_mute = bool(mix["mute"])
+            else:                                   # mix -> one output device, with its own level
+                ol = (mix.get("out_levels") or {}).get(key[2]) or {}
+                want_mute = bool(mix["mute"] or ol.get("mute"))
+                want_gain = 0.0 if want_mute else mix["vol"] / 100 * ol.get("vol", 100) / 100
+            if mod in self.fresh:                   # still settling: keep it silent
+                want_mute = True
             want = round(want_gain * FULL)
             if abs(vol_of(inp.get("volume")) - want) > 200:
                 pactl("set-sink-input-volume", inp["index"], want)
@@ -731,7 +892,8 @@ class Engine:
                 continue
             p = r.get("properties") or {}
             name = p.get("application.name") or p.get("media.name") or "Unknown"
-            if name.startswith("amx-") or name in ("pactl", "pavucontrol"):
+            if (name.startswith("amx-") or name in ("pactl", "pavucontrol")
+                    or (p.get("node.name") or "").startswith("amx_")):
                 continue
             out.append({"idx": r["index"], "name": name, "media": p.get("media.name") or "",
                         "source": src_name.get(r.get("source"), "")})
@@ -827,6 +989,11 @@ class Engine:
         self.restore_default_source()
         for mid, *_ in list(self.links.values()):
             self._unload(mid)
+        for mid in list(self.retiring):
+            self._unload(mid)
+        self.retiring.clear()
+        self.fx.stop_all()
+        self.instruments.stop_all()
         for mid, _t in list(self.sink_mods.values()):
             self._unload(mid)
         self.links.clear()
@@ -938,6 +1105,8 @@ scale.plain slider { background: #35aef5; min-width: 18px; min-height: 18px; }
 .swatch:checked { box-shadow: inset 0 0 0 2px #35aef5; background: transparent; }
 .deck-popout { background: #111113; }
 .dimbtn { opacity: .45; }
+.sb-pad { padding: 10px 12px; }
+.sb-pad:hover { background: #313131; }
 .dimbtn:hover { opacity: 1; }
 """
 
@@ -1225,7 +1394,16 @@ class ControlServer:
       {"cmd":"mix","id":M,...}                  vol / delta / mute
       {"cmd":"system","enable":true|false|"toggle"}
       {"cmd":"window","action":"show"|"hide"|"toggle"}
+      {"cmd":"output","mix":M,"output":SINK,...}    one output device of a mix: vol / delta / mute
+      {"cmd":"fx","target":C|M,"effect":E,["on":...],["param":P,"value":V]}
+                                                E: denoise gate lowcut eq deess comp limiter loud
+      {"cmd":"fx","target":C,"rack":TYPE|UID,"on":...}   a Creative Rack unit (first of that type)
+      {"cmd":"duck","id":C,"on":...}               channel ducking on / off
+      {"cmd":"soundboard","action":"play"|"stop"|"stop_all","id":ID}
+      {"cmd":"profile","name":NAME}
+      {"cmd":"tuner"}                              open the tuner window
     Without "mix", a channel command changes the channel's master fader.
+    Channels, mixes, sounds and profiles can be named by id or by (case-insensitive) name.
     """
 
     def __init__(self, app):
@@ -1354,10 +1532,39 @@ class ControlServer:
                           "system": bool(c.get("system")), "icon": c.get("icon")}
                          for c in cfg["channels"]],
             "mixes": [{"id": m["id"], "name": m["name"], "vol": m["vol"], "mute": bool(m["mute"]),
-                       "outputs": len(m["outputs"]), "icon": m.get("icon")} for m in cfg["mixes"]],
+                       "outputs": len(m["outputs"]), "icon": m.get("icon"), "mic": "mic" in m["outputs"],
+                       "outs": [{"sink": o, "name": eng.sink_desc(o),
+                                 "vol": ((m.get("out_levels") or {}).get(o) or {}).get("vol", 100),
+                                 "mute": bool(((m.get("out_levels") or {}).get(o) or {}).get("mute"))}
+                                for o in m["outputs"] if o != "mic"]} for m in cfg["mixes"]],
             "cells": cells,
             "system_default": bool(cfg.get("system_default")),
+            "fx": self.fx_state(),
+            "duck": {c["id"]: bool((c.get("duck") or {}).get("on")) for c in cfg["channels"]},
+            "soundboard": [{"id": s["id"], "name": s["name"], "playing": self.app.board.is_playing(s["id"])}
+                           for s in self.app.board.board["sounds"]] if self.app.board else [],
+            "profiles": sorted(ext.profiles(cfg), key=str.lower),
+            "profile": cfg.get("profile"),
         }
+
+    def fx_state(self):
+        out = {}
+        for o in self.app.eng.cfg["channels"] + self.app.eng.cfg["mixes"]:
+            fx = fxm.fx_of(o)
+            out[o["id"]] = {
+                "active": fxm.active(o),
+                "std": {s["key"]: {"title": s["title"], "on": bool(fx[s["key"]]["on"])} for s in fxm.offered(o)},
+                "rack": [{"uid": u["uid"], "type": u["type"], "title": fxm.RACK[u["type"]]["title"],
+                          "on": bool(u["on"])} for u in fx.get("rack", [])]}
+        return out
+
+    @staticmethod
+    def find(items, ident):
+        if ident is None:
+            return None
+        ident = str(ident)
+        return (next((x for x in items if x.get("id") == ident), None)
+                or next((x for x in items if x.get("name", "").lower() == ident.lower()), None))
 
     def _handle(self, c, msg):
         cmd = msg.get("cmd")
@@ -1385,13 +1592,13 @@ class ControlServer:
         structural = False
         if cmd in ("channel", "mix"):
             if cmd == "channel":
-                tgt = next((x for x in cfg["channels"] if x["id"] == msg.get("id")), None)
+                tgt = self.find(cfg["channels"], msg.get("id"))
             else:
-                tgt = next((x for x in cfg["mixes"] if x["id"] == msg.get("id")), None)
+                tgt = self.find(cfg["mixes"], msg.get("id"))
             if tgt is None:
                 return {"error": f"no such {cmd}"}
             if cmd == "channel" and msg.get("mix"):
-                mix = next((x for x in cfg["mixes"] if x["id"] == msg["mix"]), None)
+                mix = self.find(cfg["mixes"], msg["mix"])
                 if mix is None:
                     return {"error": "no such mix"}
                 tgt = eng.cell(mix, tgt)   # fader / mute / on for this channel in this mix
@@ -1416,6 +1623,81 @@ class ControlServer:
             else:
                 self.app.toggle_window()
             return {"ok": True}
+        elif cmd == "output":
+            mix = self.find(cfg["mixes"], msg.get("mix"))
+            if mix is None or msg.get("output") not in mix["outputs"]:
+                return {"error": "no such mix output"}
+            ol = mix.setdefault("out_levels", {}).setdefault(msg["output"], {"vol": 100, "mute": False})
+            if "vol" in msg or "delta" in msg:
+                ol["vol"] = new_vol(ol.get("vol", 100))
+            if "mute" in msg:
+                ol["mute"] = new_bool(ol.get("mute", False), "mute")
+        elif cmd == "fx":
+            obj = self.find(cfg["channels"], msg.get("target")) or self.find(cfg["mixes"], msg.get("target"))
+            if obj is None:
+                return {"error": "no such channel or mix"}
+            fx = fxm.fx_of(obj)
+            if msg.get("rack"):
+                r = str(msg["rack"]).lower()
+                unit = next((u for u in fx.get("rack", []) if u["uid"] == r), None) or \
+                    next((u for u in fx.get("rack", []) if u["type"] == r or
+                          fxm.RACK[u["type"]]["title"].lower() == r), None)
+                if unit is None:
+                    return {"error": "no such rack unit on that channel"}
+                if "on" in msg:
+                    unit["on"] = new_bool(unit["on"], "on")
+                if "param" in msg:
+                    try:
+                        unit["p"][str(msg["param"])] = float(msg["value"])
+                    except (KeyError, TypeError, ValueError):
+                        return {"error": "param needs a numeric value"}
+            else:
+                key = str(msg.get("effect") or "").lower()
+                key = {"noise": "denoise", "rnnoise": "denoise", "compressor": "comp", "deesser": "deess",
+                       "ear": "loud", "lufs": "loud", "lowcut": "lowcut"}.get(key, key)
+                if key not in fx or key == "rack":
+                    return {"error": f"no effect {key!r} on that {('mix' if 'outputs' in obj else 'channel')}"}
+                if "on" in msg:
+                    fx[key]["on"] = new_bool(fx[key]["on"], "on")
+                if "param" in msg:
+                    try:
+                        fx[key][str(msg["param"])] = float(msg["value"])
+                    except (KeyError, TypeError, ValueError):
+                        return {"error": "param needs a numeric value"}
+            win.changed()
+            win.schedule("fx", 60, win.apply_fx)
+            win.schedule("dialog-fx", 200, win.refresh_fx_widgets)
+            return {"ok": True}
+        elif cmd == "duck":
+            ch = self.find(cfg["channels"], msg.get("id"))
+            if ch is None:
+                return {"error": "no such channel"}
+            d = ch.setdefault("duck", {})
+            d["on"] = new_bool(d.get("on", False), "on")
+        elif cmd == "soundboard":
+            board, act = self.app.board, msg.get("action", "play")
+            if act == "stop_all":
+                board.stop_all()
+                return {"ok": True}
+            s = board.sound(msg.get("id"))
+            if s is None:
+                return {"error": "no such sound"}
+            if act == "stop":
+                board.stop(s["id"])
+                return {"ok": True}
+            if act == "toggle" and board.is_playing(s["id"]):
+                board.stop(s["id"])
+                return {"ok": True}
+            return {"ok": board.play(s["id"])}
+        elif cmd == "profile":
+            name = next((p for p in ext.profiles(cfg) if p.lower() == str(msg.get("name", "")).lower()), None)
+            if name is None:
+                return {"error": "no such profile"}
+            win.switch_profile(name)
+            return {"ok": True}
+        elif cmd == "tuner":
+            win.open_tuner()
+            return {"ok": True}
         else:
             return {"error": f"unknown cmd {cmd!r}"}
 
@@ -1433,7 +1715,10 @@ DECK_MODELS = [("Stream Deck MK.2  (5 × 3)", "mk2", 5, 3), ("Stream Deck Mini  
                ("Stream Deck XL  (8 × 4)", "xl", 8, 4), ("Custom size", "custom", None, None)]
 DECK_ACTIONS = [
     ("Audio · Channel", "channel"), ("Audio · Mix", "mix"), ("Audio · System sounds", "system"),
-    ("Audio · Show / hide mixer", "window"), ("System · Stat", "stat"), ("Media · Control", "media"),
+    ("Audio · Show / hide mixer", "window"), ("Audio · Effect on / off", "fx"),
+    ("Audio · Ducking on / off", "duck"), ("Audio · Switch profile", "profile"),
+    ("Soundboard · Sound", "sound"), ("Tools · Tuner", "tuner"),
+    ("System · Stat", "stat"), ("Media · Control", "media"),
     ("Deck · Change page", "page"), ("Launch · App", "app"), ("Launch · Website", "url"),
     ("Launch · Command", "command"), ("Empty", "empty")]
 DECK_MODES = [("Toggle mute", "mute"), ("Volume up", "up"), ("Volume down", "down"),
@@ -1450,6 +1735,20 @@ STAT_COLOR = {"cpu": (0.21, 0.68, 0.96), "cpu_temp": (1.0, 0.6, 0.25), "ram": (0
 MEDIA_MODES = [("Play / pause", "playpause"), ("Next track", "next"), ("Previous track", "previous"),
                ("Stop", "stop")]
 PAGE_MODES = [("Next page", "next"), ("Previous page", "prev"), ("Go to page…", "goto")]
+SOUND_MODES = [("Play (layers on repeat)", "play"), ("Play / stop", "toggle"), ("Stop", "stop"),
+               ("Stop all sounds", "stop_all")]
+NEW_ACTIONS = ("fx", "duck", "profile", "sound", "tuner")
+
+
+def fx_choices(obj):
+    """(label, value) for every effect a deck key can switch on this channel / mix."""
+    out = [(s["title"], s["key"]) for s in fxm.offered(obj)]
+    seen = set()
+    for u in (obj.get("fx") or {}).get("rack", []):
+        if u["type"] in fxm.RACK and u["type"] not in seen:
+            seen.add(u["type"])
+            out.append((f"Rack: {fxm.RACK[u['type']]['title']}", "rack:" + u["type"]))
+    return out
 BLUE, RED, GREY = (0.208, 0.682, 0.961), (1.0, 0.42, 0.42), (0.55, 0.55, 0.55)
 DECK_COLORS = [("Automatic", None), ("Blue", "#35aef5"), ("White", "#eeeeee"), ("Green", "#73d95a"),
                ("Yellow", "#fad94d"), ("Orange", "#ff9940"), ("Red", "#ff6b6b"), ("Pink", "#ff80bf"),
@@ -1795,6 +2094,24 @@ def deck_msg(key, ticks=0):
         return {"cmd": "system", "enable": "toggle" if m == "toggle" else m == "on"}
     if act == "window":
         return {"cmd": "window", "action": key.get("mode") or "toggle"}
+    if act in NEW_ACTIONS:
+        if ticks:
+            return None
+        if act == "sound":
+            mode = key.get("mode") or "play"
+            return {"cmd": "soundboard", "action": mode, "id": key.get("sound")} \
+                if mode == "stop_all" or key.get("sound") else None
+        if act == "fx":
+            eff = key.get("effect") or ""
+            if not key.get("target") or not eff:
+                return None
+            sel = {"rack": eff[5:]} if eff.startswith("rack:") else {"effect": eff}
+            return {"cmd": "fx", "target": key["target"], "on": "toggle", **sel}
+        if act == "duck":
+            return {"cmd": "duck", "id": key.get("channel"), "on": "toggle"} if key.get("channel") else None
+        if act == "profile":
+            return {"cmd": "profile", "name": key.get("profile")} if key.get("profile") else None
+        return {"cmd": "tuner"}
     if act == "mix":
         target = key.get("mix")
         base = {"cmd": "mix", "id": target}
@@ -1878,6 +2195,41 @@ def _deck_view(key, st, deck):
     if act == "command":
         cmd = key.get("command") or ""
         return {"kind": "command", "lines": ["Command", cmd or "not set"]}
+    if act == "sound":
+        mode = key.get("mode") or "play"
+        if mode == "stop_all":
+            return {"kind": "sound", "glyph": "stop", "lines": ["Stop all", "sounds"], "on": True}
+        snd = next((x for x in st.get("soundboard", []) if x["id"] == key.get("sound")), None)
+        if not snd:
+            return {"kind": "sound", "glyph": "play", "lines": ["Pick", "a sound"], "on": False}
+        playing = snd["playing"]
+        glyph = "stop" if mode == "stop" or (mode == "toggle" and playing) else "play"
+        return {"kind": "sound", "glyph": glyph, "lines": [snd["name"], "playing" if playing else snd["id"]],
+                "on": True, "playing": playing}
+    if act == "fx":
+        obj = next((x for x in st["channels"] + st["mixes"] if x["id"] == key.get("target")), None)
+        f = (st.get("fx") or {}).get(key.get("target")) or {}
+        eff = key.get("effect") or ""
+        if eff.startswith("rack:"):
+            u = next((u for u in f.get("rack", []) if u["type"] == eff[5:]), None)
+            title, on = (u["title"], u["on"]) if u else (fxm.RACK.get(eff[5:], {}).get("title", "?"), False)
+        else:
+            e = (f.get("std") or {}).get(eff)
+            title, on = (e["title"], e["on"]) if e else ("Pick", False)
+        if not obj:
+            return {"kind": "fx", "lines": ["Pick a", "channel"], "on": False}
+        return {"kind": "fx", "lines": [title, f"{obj['name']} · {'ON' if on else 'OFF'}"], "on": on}
+    if act == "duck":
+        ch = next((x for x in st["channels"] if x["id"] == key.get("channel")), None)
+        on = bool((st.get("duck") or {}).get(key.get("channel")))
+        return {"kind": "fx", "lines": [ch["name"] if ch else "Pick", "ducking " + ("ON" if on else "OFF")],
+                "on": on}
+    if act == "profile":
+        name = key.get("profile")
+        cur = name and name == st.get("profile")
+        return {"kind": "profile", "lines": [name or "Pick a", "current" if cur else "profile"], "on": bool(cur)}
+    if act == "tuner":
+        return {"kind": "tuner", "lines": ["Tuner", ""]}
     step = int(key.get("step") or 5)                     # channel / mix
     if act == "mix":
         m = next((x for x in st["mixes"] if x["id"] == key.get("mix")), None)
@@ -1970,6 +2322,24 @@ def _glyph(cr, kind, cx, cy, s, color):
     cr.set_line_cap(1)
     cr.set_line_join(1)
     h = s / 2
+    if kind == "power":
+        cr.arc(cx, cy + h * 0.1, h * 0.75, -math.pi * 0.32, math.pi * 1.32)   # ring, open at the top
+        cr.stroke()
+        cr.move_to(cx, cy - h * 0.9)
+        cr.line_to(cx, cy + h * 0.05)
+        cr.stroke()
+        cr.restore()
+        return
+    if kind == "fork":                                   # a tuning fork
+        cr.move_to(cx - h * 0.35, cy - h * 0.9)
+        cr.line_to(cx - h * 0.35, cy - h * 0.05)
+        cr.arc_negative(cx, cy - h * 0.05, h * 0.35, math.pi, 0)
+        cr.line_to(cx + h * 0.35, cy - h * 0.9)
+        cr.move_to(cx, cy + h * 0.3)
+        cr.line_to(cx, cy + h * 0.95)
+        cr.stroke()
+        cr.restore()
+        return
     if kind == "play":
         cr.move_to(cx - h * 0.6, cy - h * 0.8)
         cr.line_to(cx + h * 0.8, cy)
@@ -2302,6 +2672,14 @@ class DeckKey(Gtk.DrawingArea):
                 _glyph(cr, "window", w / 2, cy, 34, tint)
         elif kind in ("url", "command", "window"):
             _glyph(cr, {"url": "globe", "command": "terminal"}.get(kind, "window"), w / 2, cy, 36, tint)
+        elif kind == "sound":
+            _glyph(cr, v["glyph"], w / 2, cy, 34, (accent or BLUE) if v.get("playing") else
+                   (accent or (0.95, 0.95, 0.95)) if v.get("on") else GREY)
+        elif kind in ("fx", "profile"):
+            _glyph(cr, "power" if kind == "fx" else "chev-goto", w / 2, cy, 36,
+                   (accent or BLUE) if v.get("on") else GREY)
+        elif kind == "tuner":
+            _glyph(cr, "fork", w / 2, cy, 36, tint)
         self._lines(cr, w, h, v)
 
     def _pixbuf(self, cr, pb, x, y, size):
@@ -2693,7 +3071,7 @@ class DeckView(Gtk.Box):
         if not key:
             return
         act = key.get("action")
-        if act in ("channel", "mix", "system", "window"):
+        if act in ("channel", "mix", "system", "window") + NEW_ACTIONS:
             msg = deck_msg(key, ticks)
             if msg:
                 self.app.control.command(msg)
@@ -2773,7 +3151,14 @@ class DeckView(Gtk.Box):
                     "mix": {"mix": cfg["mixes"][0]["id"] if cfg["mixes"] else None, "mode": "mute", "step": 5},
                     "system": {"mode": "toggle"}, "window": {"mode": "toggle"}, "stat": {"stat": "cpu"},
                     "media": {"mode": "playpause"}, "page": {"mode": "next"}, "app": {"app": None},
-                    "url": {"url": ""}, "command": {"command": ""}}
+                    "url": {"url": ""}, "command": {"command": ""},
+                    "sound": {"sound": next((x["id"] for x in self.app.board.board["sounds"]), None),
+                              "mode": "play"},
+                    "fx": {"target": cfg["channels"][0]["id"] if cfg["channels"] else None,
+                           "effect": "denoise" if cfg["channels"] and cfg["channels"][0]["type"] == "hw"
+                           else "comp"},
+                    "duck": {"channel": cfg["channels"][0]["id"] if cfg["channels"] else None},
+                    "profile": {"profile": next(iter(sorted(ext.profiles(cfg))), None)}}
                 title = (self.key(r, c) or {}).get("title")
                 self.set_key(r, c, None)
                 update(action=v, title=title, **defaults.get(v, {}))
@@ -2821,6 +3206,43 @@ class DeckView(Gtk.Box):
                 dd.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
                 dd.set_enable_search(True)
                 row("App", dd)
+            if act == "sound":
+                snds = self.app.board.board["sounds"]
+                if snds:
+                    row("Sound", dropdown([(f"{x['name']}  ({x['id']})", x["id"]) for x in snds],
+                                          k.get("sound"), lambda v: update(sound=v)))
+                else:
+                    box.append(Gtk.Label(label="Add sounds on the Soundboard page first.", xalign=0,
+                                         css_classes=["sub"]))
+                row("Key press", dropdown(SOUND_MODES, k.get("mode") or "play", lambda v: update(mode=v)))
+            if act == "fx":
+                objs = cfg["channels"] + cfg["mixes"]
+
+                def set_target(v):
+                    o = next((x for x in objs if x["id"] == v), None)
+                    ch = fx_choices(o) if o else []
+                    update(target=v, effect=ch[0][1] if ch else None)
+                    fill()
+                row("On", dropdown([(x["name"] + ("  (mix)" if "outputs" in x else ""), x["id"]) for x in objs],
+                                   k.get("target"), set_target))
+                o = next((x for x in objs if x["id"] == k.get("target")), None)
+                if o:
+                    row("Effect", dropdown(fx_choices(o), k.get("effect"), lambda v: update(effect=v)))
+                box.append(Gtk.Label(label="Each press switches the effect on or off; its settings are kept.",
+                                     wrap=True, xalign=0, css_classes=["sub"]))
+            if act == "duck":
+                row("Channel", dropdown([(x["name"], x["id"]) for x in cfg["channels"]], k.get("channel"),
+                                        lambda v: update(channel=v)))
+                box.append(Gtk.Label(label="Set what triggers the ducking in the channel's settings.",
+                                     wrap=True, xalign=0, css_classes=["sub"]))
+            if act == "profile":
+                profs = sorted(ext.profiles(cfg), key=str.lower)
+                if profs:
+                    row("Profile", dropdown([(p_, p_) for p_ in profs], k.get("profile"),
+                                            lambda v: update(profile=v)))
+                else:
+                    box.append(Gtk.Label(label="Save a profile in Settings first.", xalign=0,
+                                         css_classes=["sub"]))
             if act == "url":
                 row("Address", entry("url", "example.com"))
             if act == "command":
@@ -3005,7 +3427,9 @@ class MixerWindow(Adw.ApplicationWindow):
         navbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_start=6, margin_end=6)
         for key, label, icon in (("mixes", "Mixes", "view-list-symbolic"),
                                  ("deck", "Deck", "view-grid-symbolic"),
-                                 ("apps", "Apps", "applications-multimedia-symbolic")):
+                                 ("apps", "Apps", "applications-multimedia-symbolic"),
+                                 ("soundboard", "Soundboard", "media-playlist-shuffle-symbolic"),
+                                 ("settings", "Settings", "preferences-system-symbolic")):
             b = Gtk.ToggleButton(css_classes=["navbtn", "flat"])
             row = Gtk.Box(spacing=12)
             row.append(Gtk.Image(icon_name=icon))
@@ -3020,6 +3444,14 @@ class MixerWindow(Adw.ApplicationWindow):
                       self.stack.set_visible_child_name(k))
             navbox.append(b)
         side.append(navbox)
+        tuner_b = Gtk.Button(css_classes=["navbtn", "flat"], margin_start=6, margin_end=6,
+                             tooltip_text="Instrument tuner")
+        trow = Gtk.Box(spacing=12)
+        trow.append(Gtk.Image(icon_name=safe_icon("audio-input-microphone-symbolic")))
+        trow.append(Gtk.Label(label="Tuner"))
+        tuner_b.set_child(trow)
+        tuner_b.connect("clicked", lambda *_: self.open_tuner())
+        side.append(tuner_b)
         side.append(Gtk.Box(vexpand=True))
         quit_b = Gtk.Button(css_classes=["navbtn", "flat"], margin_start=6, margin_end=6,
                             tooltip_text="Stops routing and removes the virtual devices")
@@ -3034,7 +3466,16 @@ class MixerWindow(Adw.ApplicationWindow):
         self.stack.add_named(self._build_mixes_page(), "mixes")
         self.stack.add_named(self._build_deck_page(), "deck")
         self.stack.add_named(self._build_apps_page(), "apps")
+        self.soundboard_page = ext.SoundboardPage(self, app.board)
+        self.stack.add_named(self.soundboard_page, "soundboard")
+        self.settings_page = ext.SettingsPage(self)
+        self.stack.add_named(self.settings_page, "settings")
+        self.stack.connect("notify::visible-child-name", lambda st, _p: st.get_visible_child_name() == "settings"
+                           and self.settings_page.rebuild())
         split.set_content(self.stack)
+        self._fx_refreshers = []       # callbacks that redraw open effect editors after a remote change
+        self._duck_until = {}
+        self._tuner = None
 
         self.connect("close-request", self._on_close)
         self.rebuild_all()
@@ -3196,6 +3637,103 @@ class MixerWindow(Adw.ApplicationWindow):
             self._deck_win.close()
         else:
             self.open_deck_window()
+
+    # ---- effects, profiles, tools
+    def apply_fx(self):
+        if self.eng.apply_fx():
+            self.sync_meters()
+            self.build_matrix()
+
+    def fx_edit(self):
+        """Callback for effect editors: save and apply (debounced)."""
+        self.changed()
+        self.schedule("fx", 60, self.apply_fx)
+
+    def refresh_fx_widgets(self):
+        for fn in list(self._fx_refreshers):
+            try:
+                fn()
+            except Exception:
+                self._fx_refreshers.remove(fn)
+        self.build_matrix()
+
+    def switch_profile(self, name):
+        self.app.board.stop_all()
+        if ext.switch_profile(self.cfg, name):
+            self.toast(f"Profile: {name}")
+            self.structure_changed()
+
+    def replace_config(self, new):
+        """Load a whole imported configuration in place of the current one."""
+        self.app.board.stop_all()
+        try:
+            new = normalize(copy.deepcopy(new))
+        except (KeyError, TypeError, AttributeError):
+            self.toast("That configuration is damaged")
+            return
+        self.cfg.clear()
+        self.cfg.update(new)
+        normalize_deck(self.cfg)
+        self.structure_changed()
+        self.deck_layout_changed()
+        self.soundboard_page.rebuild()
+        self.toast("Configuration imported")
+
+    def open_tuner(self):
+        if self._tuner is not None:
+            self._tuner.present()
+            return
+        self._tuner = ext.TunerWindow(self)
+
+        def closed(*_):
+            self._tuner = None
+            return False
+        self._tuner.connect("close-request", closed)
+        self._tuner.present()
+
+    def open_rack_window(self, obj):
+        """The Creative Rack as its own window, to keep open next to whatever you play into."""
+        w = Adw.Window(title=f"{obj['name']} — Creative Rack", default_width=520, default_height=760)
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar(css_classes=["flat"]))
+        holder = Gtk.Box(margin_top=6, margin_bottom=12, margin_start=12, margin_end=12)
+        tv.set_content(holder)
+        w.set_content(tv)
+
+        def build():
+            clear(holder)
+            ed = fxm.rack_editor(obj, self.fx_edit, self.fx_edit, self.toast, holder)
+            ed.set_hexpand(True)
+            holder.append(ed)
+        build()
+        self._fx_refreshers.append(build)
+        w.connect("close-request", lambda *_: (build in self._fx_refreshers and
+                                               self._fx_refreshers.remove(build), False)[1])
+        w.present()
+
+    def _duck_tick(self):
+        """Ducking: lower a channel while any of its trigger channels is active."""
+        now = time.monotonic()
+        moved = False
+        for ch in self.cfg["channels"]:
+            d = ch.get("duck") or {}
+            cur = self.eng.duck.get(ch["id"], 1.0)
+            target = 1.0
+            if d.get("on") and d.get("by"):
+                thr = 10 ** (d.get("threshold", -40) / 20)
+                if any(self.meters.level.get(t, 0) > thr for t in d["by"] if t != ch["id"]):
+                    self._duck_until[ch["id"]] = now + d.get("hold", 500) / 1000
+                if now < self._duck_until.get(ch["id"], 0):
+                    target = 10 ** (-d.get("amount", 12) / 20)
+            if target < cur:
+                new = max(target, cur * 0.55)                     # duck fast
+            else:
+                new = min(target, cur + (1 - cur) * 0.12 + 0.004)   # recover smoothly
+            if abs(new - cur) > 1e-4:
+                self.eng.duck[ch["id"]] = new
+                moved = True
+        if moved:
+            self.eng.apply_levels()
 
     def toast(self, text):
         if getattr(self, "_toasts", None) is not None:
@@ -3419,6 +3957,10 @@ class MixerWindow(Adw.ApplicationWindow):
         subtxt = ("Hardware input" if ch["type"] == "hw"
                   else "System sounds" if ch.get("system")
                   else f"{n_apps} app{'s' if n_apps != 1 else ''}")
+        if fxm.active(ch):
+            subtxt += "  ·  FX"
+        if (ch.get("duck") or {}).get("on"):
+            subtxt += "  ·  ducking"
         head.append(Gtk.Label(label=ch["name"], xalign=0, hexpand=True, css_classes=["chname"],
                               ellipsize=3))
         head.append(Gtk.Label(label=subtxt, css_classes=["sub"]))
@@ -3641,6 +4183,7 @@ class MixerWindow(Adw.ApplicationWindow):
             return mb, pop, pbox
 
         group = [None]
+        fx_builds = []
         if is_mix:
             page, lst = list_page("", "")
             addb, pop, pbox = popover_button("list-add-symbolic", "Add output")
@@ -3662,6 +4205,26 @@ class MixerWindow(Adw.ApplicationWindow):
                     else:
                         r = Adw.ActionRow(title=GLib.markup_escape_text(eng.sink_desc(o)))
                         r.add_prefix(Gtk.Image(icon_name="audio-speakers-symbolic"))
+                        ol = obj.setdefault("out_levels", {}).setdefault(o, {"vol": 100, "mute": False})
+
+                        def set_omute(v, ol=ol):
+                            ol["mute"] = v
+                            self.changed()
+                            eng.apply_levels()
+
+                        def set_ovol(sc_, ol=ol):
+                            ol["vol"] = round(sc_.get_value())
+                            self.changed()
+                            self.schedule("levels", 40, eng.apply_levels)
+                        r.add_suffix(mute_button(ol.get("mute", False), set_omute))
+                        osc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+                        osc.add_css_class("plain")
+                        osc.set_size_request(150, -1)
+                        osc.set_valign(Gtk.Align.CENTER)
+                        osc.set_value(ol.get("vol", 100))
+                        osc.set_tooltip_text("This output's own level (on top of the mix volume)")
+                        osc.connect("value-changed", set_ovol)
+                        r.add_suffix(osc)
                     rm = Gtk.Button(icon_name="user-trash-symbolic", css_classes=["flat"],
                                     valign=Gtk.Align.CENTER, tooltip_text="Remove output")
 
@@ -3718,6 +4281,7 @@ class MixerWindow(Adw.ApplicationWindow):
             pop.connect("show", fill_pop)
             fill_outputs()
             add_tab("outputs", "Audio outputs", page, group)
+            add_tab("effects", "Effects", self._fx_tab(obj, "effects", fx_builds), group)
 
             sp = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
 
@@ -3933,6 +4497,8 @@ class MixerWindow(Adw.ApplicationWindow):
                 fill_apps()
                 add_tab("apps", "Apps", page, group)
 
+            add_tab("effects", "Effects", self._fx_tab(obj, "effects", fx_builds), group)
+            add_tab("creative", "Creative", self._fx_tab(obj, "creative", fx_builds), group)
             sp = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
             r = Gtk.Box(spacing=12)
             r.append(Gtk.Label(label="Mute channel", hexpand=True, xalign=0))
@@ -3968,14 +4534,18 @@ class MixerWindow(Adw.ApplicationWindow):
                     label="Apps assigned to this channel are moved into it automatically. "
                           "You can also set the channel as the Default output to catch "
                           "everything else.", xalign=0, wrap=True, css_classes=["sub"]))
-            add_tab("settings", "Channel settings", sp, group)
+            sp.append(self._duck_box(obj))
+            if obj["type"] == "virtual":
+                sp.append(self._midi_box(obj))
+            ssw_ = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            ssw_.set_child(sp)
+            add_tab("settings", "Channel settings", ssw_, group)
 
         # always open on the first tab
         first_tab = tabs.get_first_child()
         if first_tab is not None:
             first_tab.set_active(True)
-            stack.set_visible_child_name("outputs" if is_mix else
-                                         ("apps" if obj["type"] == "virtual" else "settings"))
+            stack.set_visible_child(stack.get_first_child())
 
         # bottom row
         bottom = Gtk.Box(spacing=12)
@@ -4003,6 +4573,9 @@ class MixerWindow(Adw.ApplicationWindow):
 
         def on_closed(_d):
             self._dialog_open = False
+            for fn in fx_builds:
+                if fn in self._fx_refreshers:
+                    self._fx_refreshers.remove(fn)
             if is_mix:
                 eng.rename_mix_sink(obj)
             else:
@@ -4010,6 +4583,107 @@ class MixerWindow(Adw.ApplicationWindow):
             self.structure_changed()
         dlg.connect("closed", on_closed)
         dlg.present(self)
+
+    def _fx_tab(self, obj, which, registry):
+        """A tab holding the effects (or Creative Rack) editor, rebuilt after remote changes."""
+        holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
+
+        def build():
+            clear(holder)
+            if which == "effects":
+                ed = fxm.effects_editor(obj, self.fx_edit)
+            else:
+                ed = fxm.rack_editor(obj, self.fx_edit, self.fx_edit, self.toast, holder)
+                pop = Gtk.Button(label="Open the rack in its own window", css_classes=["flat"],
+                                 halign=Gtk.Align.END)
+                pop.connect("clicked", lambda *_: self.open_rack_window(obj))
+                holder.append(pop)
+            ed.set_vexpand(True)
+            holder.append(ed)
+            if not self.eng.fx.ok:
+                holder.prepend(Gtk.Label(label=f"Effects are unavailable: {self.eng.fx.msg}", wrap=True,
+                                         xalign=0, css_classes=["sub"]))
+        build()
+        registry.append(build)
+        self._fx_refreshers.append(build)
+        return holder
+
+    def _duck_box(self, obj):
+        d = obj.setdefault("duck", {})
+        d.setdefault("on", False)
+        d.setdefault("by", [])
+        d.setdefault("amount", 12)
+        d.setdefault("threshold", -40)
+        d.setdefault("hold", 500)
+        grp = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        exp = Adw.ExpanderRow(title="Ducking", subtitle="Turn this channel down while other channels are "
+                                                        "active (e.g. music while you or your friends talk)",
+                              show_enable_switch=True, enable_expansion=bool(d["on"]))
+
+        def toggled(e, _p):
+            d["on"] = e.get_enable_expansion()
+            self.changed()
+        exp.connect("notify::enable-expansion", toggled)
+        for c in self.cfg["channels"]:
+            if c["id"] == obj["id"]:
+                continue
+            row = Adw.SwitchRow(title=f"When “{GLib.markup_escape_text(c['name'])}” is active",
+                                active=c["id"] in d["by"])
+
+            def pick(r, _p, cid=c["id"]):
+                d["by"] = [x for x in d["by"] if x != cid] + ([cid] if r.get_active() else [])
+                self.changed()
+            row.connect("notify::active", pick)
+            exp.add_row(row)
+        for key, p in (("amount", fxm.P("a", "Turn down by", 0, 40, 12, "dB")),
+                       ("threshold", fxm.P("t", "Trigger level", -70, -10, -40, "dB")),
+                       ("hold", fxm.P("h", "Hold", 0, 3000, 500, "ms"))):
+            def setv(v, key=key):
+                d[key] = v
+                self.changed()
+            exp.add_row(fxm.param_row(p, float(d[key]), setv))
+        grp.append(exp)
+        return grp
+
+    def _midi_box(self, obj):
+        m = obj.setdefault("midi", {})
+        grp = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        have = shutil.which("fluidsynth") is not None
+
+        def resync():
+            self.eng.instruments.sync(self.cfg["channels"], {s["name"] for s in self.eng.sinks})
+        exp = Adw.ExpanderRow(title="MIDI instrument",
+                              subtitle="Play a SoundFont from any MIDI keyboard into this channel (FluidSynth)"
+                              if have else "Install fluidsynth to use MIDI instruments",
+                              show_enable_switch=True, enable_expansion=bool(m.get("on")) and have,
+                              sensitive=have)
+        sf = Adw.ActionRow(title="SoundFont", subtitle=GLib.markup_escape_text(
+            os.path.basename(m["sf2"]) if m.get("sf2") else "None chosen (.sf2 / .sf3)"))
+        choose = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
+
+        def chosen(path):
+            m["sf2"] = path
+            sf.set_subtitle(GLib.markup_escape_text(os.path.basename(path)))
+            self.changed()
+            resync()
+        choose.connect("clicked", lambda *_: ext.file_dialog(choose, "Choose a SoundFont", done=chosen,
+                                                             patterns=["SoundFonts", "*.sf2", "*.sf3"]))
+        sf.add_suffix(choose)
+        exp.add_row(sf)
+
+        def setg(v):
+            m["gain"] = v
+            self.changed()
+            self.schedule("midi", 600, resync)
+        exp.add_row(fxm.param_row(fxm.P("g", "Synth level", 0.1, 2.0, 0.6, "", 2), float(m.get("gain", 0.6)), setg))
+
+        def toggled(e, _p):
+            m["on"] = e.get_enable_expansion()
+            self.changed()
+            resync()
+        exp.connect("notify::enable-expansion", toggled)
+        grp.append(exp)
+        return grp
 
     def build_apps(self):
         eng = self.eng
@@ -4089,6 +4763,7 @@ class MixerWindow(Adw.ApplicationWindow):
 
     def _meter_tick(self):
         self.meters.tick()
+        self._duck_tick()
         self._deck_n = (self._deck_n + 1) % 4
         if self._deck_n == 0:
             self.refresh_decks()
@@ -4105,13 +4780,15 @@ class App(Adw.Application):
         self.eng = None
         self.tray = None
         self.control = None
+        self.board = None
+        self.companion = None
 
     def do_startup(self):
         Adw.Application.do_startup(self)
         Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
         Gtk.Window.set_default_icon_name(APP_ID)
         prov = Gtk.CssProvider()
-        prov.load_from_data(CSS)
+        prov.load_from_data(CSS + fxm.RACK_CSS)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         q = Gio.SimpleAction.new("quit", None)
@@ -4135,6 +4812,8 @@ class App(Adw.Application):
             eng.reconcile()
             save_config(cfg)
             self.control = ControlServer(self)
+            self.board = ext.Soundboard(self)
+            self.companion = ext.Companion(self)
             kwin_cleanup_stale()
             self.win = MixerWindow(self, eng)
             self.win.sync_meters()
@@ -4144,6 +4823,9 @@ class App(Adw.Application):
                              lambda: self.win and self.win.toggle_deck_window())
             self.tray.start()
             self.control.start()
+            cc = cfg.get("companion") or {}
+            if cc.get("autostart"):
+                self.companion.start(cc.get("port", 8787))
             page = os.environ.get("AMX_DEBUG_PAGE")  # testing aids: open a page / save the window
             if page:
                 GLib.timeout_add(600, lambda: self.win.stack.set_visible_child_name(page) and False)
@@ -4196,13 +4878,117 @@ class App(Adw.Application):
                 pass
         if self.control:
             self.control.stop()
+        if self.companion:
+            self.companion.stop()
+        if self.board:
+            self.board.stop_all()
         if self.win:
             self.win.meters.stop()
+            if self.win._tuner is not None:
+                self.win._tuner.stop()
         if self.eng:
             self.eng.teardown()
         self.quit()
         return False
 
 
+CTL_HELP = """usage: audio_mixer.py ctl <command> [args]   (talks to the running mixer)
+
+  state                              print the mixer state as JSON
+  play <sound>  |  stop <sound>  |  stop-all          soundboard (sound = 4-digit id or name)
+  toggle <sound>                     play, or stop if it is playing
+  fx <channel|mix> <effect> [on|off|toggle]           effect: denoise gate lowcut eq deess comp
+                                                      limiter loud, or a rack unit (reverb, delay, ...)
+  fx-set <channel|mix> <effect> <param> <value>       e.g. fx-set Mic gate Threshold -50
+  mute <channel> [mix] [on|off|toggle]
+  vol <channel> <0-100|+N|-N> [mix]
+  mix-vol <mix> <0-100|+N|-N>   |  mix-mute <mix> [on|off|toggle]
+  duck <channel> [on|off|toggle]
+  profile <name>
+  tuner                              open the tuner window
+  show | hide | toggle               the mixer window
+  json '<object>'                    send a raw command (see ControlServer)
+"""
+
+
+def ctl_main(args):
+    def onoff(v):
+        return {"on": True, "off": False, "toggle": "toggle"}.get((v or "toggle").lower(), "toggle")
+
+    def vol(v):
+        return {"delta": int(v)} if v[:1] in "+-" else {"vol": int(v)}
+    a = args
+    try:
+        c = a[0] if a else "help"
+        if c == "state":
+            msg = {"cmd": "state"}
+        elif c in ("play", "stop") or (c == "toggle" and len(a) > 1):
+            msg = {"cmd": "soundboard", "action": c, "id": " ".join(a[1:])}
+        elif c == "stop-all":
+            msg = {"cmd": "soundboard", "action": "stop_all"}
+        elif c == "fx":
+            rack = a[2].lower() in fxm.RACK or a[2].lower() in {d["title"].lower() for d in fxm.RACK.values()}
+            msg = {"cmd": "fx", "target": a[1], ("rack" if rack else "effect"): a[2],
+                   "on": onoff(a[3] if len(a) > 3 else None)}
+        elif c == "fx-set":
+            rack = a[2].lower() in fxm.RACK
+            msg = {"cmd": "fx", "target": a[1], ("rack" if rack else "effect"): a[2], "param": a[3],
+                   "value": float(a[4])}
+        elif c == "mute":
+            rest = a[2:]
+            state = rest.pop() if rest and rest[-1].lower() in ("on", "off", "toggle") else None
+            msg = {"cmd": "channel", "id": a[1], "mute": onoff(state)}
+            if rest:
+                msg["mix"] = rest[0]
+        elif c == "vol":
+            msg = dict({"cmd": "channel", "id": a[1]}, **vol(a[2]))
+            if len(a) > 3:
+                msg["mix"] = a[3]
+        elif c == "mix-vol":
+            msg = dict({"cmd": "mix", "id": a[1]}, **vol(a[2]))
+        elif c == "mix-mute":
+            msg = {"cmd": "mix", "id": a[1], "mute": onoff(a[2] if len(a) > 2 else None)}
+        elif c == "duck":
+            msg = {"cmd": "duck", "id": a[1], "on": onoff(a[2] if len(a) > 2 else None)}
+        elif c == "profile":
+            msg = {"cmd": "profile", "name": " ".join(a[1:])}
+        elif c == "tuner":
+            msg = {"cmd": "tuner"}
+        elif c in ("show", "hide", "toggle"):
+            msg = {"cmd": "window", "action": c}
+        elif c == "json":
+            msg = json.loads(a[1])
+        else:
+            print(CTL_HELP, end="")
+            return 0 if c in ("help", "-h", "--help") else 2
+    except (IndexError, ValueError):
+        print(CTL_HELP, end="")
+        return 2
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "audio-mixer.sock")
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(path)
+        s.sendall(json.dumps(msg).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except OSError as e:
+        print(f"audio mixer is not running ({e})", file=sys.stderr)
+        return 1
+    reply = json.loads(buf.split(b"\n")[0] or b"{}")
+    if c == "state":
+        print(json.dumps(reply, indent=2))
+    elif reply.get("error"):
+        print(reply["error"], file=sys.stderr)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "ctl":
+        sys.exit(ctl_main(sys.argv[2:]))
     sys.exit(App().run(sys.argv))
