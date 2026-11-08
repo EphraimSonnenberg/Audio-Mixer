@@ -231,8 +231,24 @@ class Soundboard:
             self._meta[s["id"]] = e
         return e
 
+    def prune_cache(self):
+        """Delete cached decodes of files no longer on the board."""
+        keep = {hashlib.sha1(os.path.abspath(s["file"]).encode()).hexdigest()[:20] for s in self.board["sounds"]}
+        try:
+            names = os.listdir(PCM_CACHE)
+        except OSError:
+            return
+        for f in names:
+            if f.split("-", 1)[0] not in keep and not f.endswith(".tmp"):
+                try:
+                    os.unlink(os.path.join(PCM_CACHE, f))
+                except OSError:
+                    pass
+
     def preload(self, sounds, done):
         def work():
+            if sounds is self.board["sounds"]:
+                self.prune_cache()          # a full preload (startup): drop leftovers
             for s in sounds:
                 self._entry(s)
                 # one-shot: an idle callback that returns anything truthy is re-run forever
@@ -376,7 +392,13 @@ class Soundboard:
                 os.unlink(s["file"])
             except OSError:
                 pass
-        self._meta.pop(s["id"], None)
+        e = self._meta.pop(s["id"], None)
+        if e and not any(x["file"] == s["file"] for x in self.board["sounds"]):
+            for f in (e["path"], e["path"][:-4] + ".peaks"):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
 
     def export_zip(self, path):
         b = copy.deepcopy(self.board)

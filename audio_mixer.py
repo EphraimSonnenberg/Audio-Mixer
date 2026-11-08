@@ -355,10 +355,13 @@ class PaEvents:
         self.on_change = on_change
         self.proc = self.watch = None
         self.buf = b""
+        self.stopped = False
         self._start()
 
     def _start(self):
         self.watch = None
+        if self.stopped:
+            return False
         try:
             self.proc = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE,
                                          stderr=subprocess.DEVNULL)
@@ -378,6 +381,8 @@ class PaEvents:
         except OSError:
             data = b""
         if not data:                    # the sound server went away (or restarted): reconnect
+            self.watch = None           # returning False removes it
+            self.buf = b""
             self._reap()
             GLib.timeout_add(2000, self._start)
             self.on_change()
@@ -399,6 +404,7 @@ class PaEvents:
             self.proc = None
 
     def stop(self):
+        self.stopped = True
         if self.watch:
             GLib.source_remove(self.watch)
             self.watch = None
@@ -3889,6 +3895,7 @@ class MixerWindow(Adw.ApplicationWindow):
                 d.on_layout()
 
     def _stats_tick(self):
+        self.sync_meters()        # follows ducking settings and dead meters within a second
         visible = [d for d in self.decks if d.get_mapped()]
         if any(d.uses(("stat",)) for d in visible):
             self.stats.sample()
