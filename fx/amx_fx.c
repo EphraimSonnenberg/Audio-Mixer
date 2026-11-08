@@ -409,15 +409,30 @@ static const char *const lim_cn[] = {"Enabled", "Ceiling", "Release"};
 static const float lim_cr[][3] = {{0, 1, 0}, {-24, 0, -1}, {10, 1000, 80}};
 
 /* ---- loudness limiter / ear protection (BS.1770 K-weighted momentary loudness, cut only)
- * The cut lands at once (1 ms, just enough not to click) and only fades back up (1.5 s).
- * Momentary loudness is a 400 ms window sliding in 10 ms steps; a fast 5 ms detector, which
- * only acts LOUD_FAST_MARGIN dB above the target so normal transients don't trip it, catches a
- * sudden blast within about 10 ms instead of waiting for the 400 ms window to fill. */
+ * Two cuts, and the larger one applies:
+ *  - steady: momentary loudness (400 ms window sliding in 10 ms steps) over the target, eased in
+ *    over 150 ms and faded back up over 1.5 s, as a smooth loudness rider.
+ *  - instant: a fast detector (LOUD_FAST_MS RMS) watches what is left after the steady cut.
+ *    When that suddenly jumps more than LOUD_FAST_MARGIN dB over the target (a blast, not normal
+ *    drum hits), the extra cut goes down at once (1 ms, just enough not to click), fully from
+ *    LOUD_FAST_FULL dB over, is held for LOUD_HOLD_MS so the gain can't follow the waveform (that
+ *    buzzes), and then only fades back up (1.5 s) while the steady cut takes over. */
+#ifndef LOUD_FAST_MS
+#define LOUD_FAST_MS 10.f
+#endif
+#ifndef LOUD_FAST_MARGIN
+#define LOUD_FAST_MARGIN 8.f
+#endif
+#ifndef LOUD_FAST_FULL
+#define LOUD_FAST_FULL 12.f
+#endif
+#ifndef LOUD_HOLD_MS
+#define LOUD_HOLD_MS 400.f
+#endif
 #define LOUD_NB 40              /* 40 x 10 ms = 400 ms momentary window */
-#define LOUD_FAST_MARGIN 6.f
 typedef struct {
-    bq_t k1, k2; double acc, sum, fast; unsigned cnt, blk; double blocks[LOUD_NB]; int bi, ready;
-    float gr, want;
+    bq_t k1, k2; double acc, sum, fast; unsigned cnt, blk, hold; double blocks[LOUD_NB]; int bi, ready;
+    float gr, gs, gf, want;
 } loud_t;
 static void loud_init(inst_t *I) {
     loud_t *S = I->st;
@@ -428,10 +443,10 @@ static void loud_init(inst_t *I) {
 static void loud_run(inst_t *I, float *const in[2], float *out[2], unsigned n) {
     loud_t *S = I->st;
     float target = I->c[1], maxcut = I->c[2];
-    float at = tc(1.f, I->sr), rt = tc(1500.f, I->sr), ceil_ = db2lin(-1.f), knee = ceil_ * 0.8f;
-    double fa = 1.0 - tc(5.f, I->sr);
-    /* fast-detector power above which it starts cutting (dB -> mean square, undoing the -0.691) */
-    double fthr = pow(10.0, (target + LOUD_FAST_MARGIN + 0.691) / 10.0);
+    float at = tc(150.f, I->sr), fat = tc(1.f, I->sr), rt = tc(1500.f, I->sr);
+    float ceil_ = db2lin(-1.f), knee = ceil_ * 0.8f;
+    double fa = 1.0 - tc(LOUD_FAST_MS, I->sr);
+    unsigned holdn = (unsigned)(LOUD_HOLD_MS * 0.001f * I->sr);
     for (unsigned i = 0; i < n; i++) {
         double p = 0;
         for (int c = 0; c < 2; c++) {
@@ -451,16 +466,26 @@ static void loud_run(inst_t *I, float *const in[2], float *out[2], unsigned n) {
             float L = -0.691f + 10.f * log10f((float)(S->sum / S->ready) + 1e-12f);
             S->want = L > target ? fminf(maxcut, L - target) : 0.f;
         }
-        float want = S->want;
-        if (S->fast > fthr) {
-            /* E = how far the fast reading is over the target (> M here).  Nothing at the margin
-             * M, the full E from 2M up, a steep knee between: a big blast is cut completely at
-             * once while normal peaks just over the target are barely touched. */
-            float E = -0.691f + 10.f * log10f((float)S->fast) - target;
-            float cut = E >= 2.f * LOUD_FAST_MARGIN ? E : 2.f * (E - LOUD_FAST_MARGIN);
-            want = fmaxf(want, fminf(maxcut, cut));
+        /* steady cut */
+        S->gs = S->want + (S->gs - S->want) * (S->want > S->gs ? at : rt);
+        /* instant cut: R = how far over the target the audio is after the steady cut (measured
+         * against the steady cut, not the total, so the instant cut doesn't stop itself early) */
+        float wf = 0.f;
+        float R = -0.691f + 10.f * log10f((float)S->fast + 1e-12f) - target - S->gs;
+        if (R > LOUD_FAST_MARGIN) {
+            float extra = R >= LOUD_FAST_FULL ? R
+                        : (R - LOUD_FAST_MARGIN) * LOUD_FAST_FULL / (LOUD_FAST_FULL - LOUD_FAST_MARGIN);
+            wf = fminf(maxcut, S->gs + extra);
         }
-        S->gr = want + (S->gr - want) * (want > S->gr ? at : rt);
+        if (wf > S->gf) {
+            S->gf = wf + (S->gf - wf) * fat;
+            S->hold = holdn;
+        } else if (S->hold) {
+            S->hold--;
+        } else {
+            S->gf *= rt;
+        }
+        S->gr = fmaxf(S->gs, S->gf);
         float g = db2lin(-S->gr);
         for (int c = 0; c < 2; c++) {
             float y = in[c][i] * g, a = fabsf(y);
