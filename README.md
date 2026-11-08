@@ -84,6 +84,16 @@ Arch / CachyOS: `sudo pacman -S python-gobject gtk4 libadwaita python-cairo libp
 
 ## Run
 
+## Install (Arch / CachyOS)
+
+From the AUR (`audio-mixer-git`):
+
+```sh
+paru -S audio-mixer-git     # or: yay -S audio-mixer-git
+```
+
+Or build it from this repo: `cd packaging/aur && makepkg -si`. That installs the `audio-mixer` command, a menu entry and the icon, and builds the effects plugin at package time. The OpenDeck plugin is at `/usr/share/audio-mixer/opendeck/install.sh`.
+
 ```sh
 python3 audio_mixer.py
 ```
@@ -111,3 +121,7 @@ sh opendeck/install.sh
 ```
 
 Restart OpenDeck afterwards. The plugin talks to the mixer through a local socket at `$XDG_RUNTIME_DIR/audio-mixer.sock`, which takes JSON lines. The protocol is documented in `ControlServer` in `audio_mixer.py`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

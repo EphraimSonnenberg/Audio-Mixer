@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Audio Mixer
+GenericName=Audio Mixer
+Comment=Wave Link style software mixer for PipeWire
+Exec=audio-mixer
+Icon=io.github.lawsonf.AudioMixer
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;GTK;
+Keywords=mixer;pipewire;pulseaudio;stream;deck;soundboard;
+StartupNotify=true

@@ -1,0 +1,5 @@
+post_install() {
+  echo ">> Run 'audio-mixer' or launch Audio Mixer from your app menu."
+  echo ">> OpenDeck plugin: sh /usr/share/audio-mixer/opendeck/install.sh"
+}
+post_upgrade() { post_install; }
