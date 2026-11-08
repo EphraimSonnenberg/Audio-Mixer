@@ -408,35 +408,59 @@ static void lim_run(inst_t *I, float *const in[2], float *out[2], unsigned n) {
 static const char *const lim_cn[] = {"Enabled", "Ceiling", "Release"};
 static const float lim_cr[][3] = {{0, 1, 0}, {-24, 0, -1}, {10, 1000, 80}};
 
-/* ---- loudness limiter / ear protection (BS.1770 K-weighted momentary loudness, cut only) */
-typedef struct { bq_t k1, k2; double acc; unsigned cnt, blk; double blocks[4]; int bi; float gr, want; int ready; } loud_t;
+/* ---- loudness limiter / ear protection (BS.1770 K-weighted momentary loudness, cut only)
+ * The cut lands at once (1 ms, just enough not to click) and only fades back up (1.5 s).
+ * Momentary loudness is a 400 ms window sliding in 10 ms steps; a fast 5 ms detector, which
+ * only acts LOUD_FAST_MARGIN dB above the target so normal transients don't trip it, catches a
+ * sudden blast within about 10 ms instead of waiting for the 400 ms window to fill. */
+#define LOUD_NB 40              /* 40 x 10 ms = 400 ms momentary window */
+#define LOUD_FAST_MARGIN 6.f
+typedef struct {
+    bq_t k1, k2; double acc, sum, fast; unsigned cnt, blk; double blocks[LOUD_NB]; int bi, ready;
+    float gr, want;
+} loud_t;
 static void loud_init(inst_t *I) {
     loud_t *S = I->st;
     bq_set(&S->k1, BQ_HIGHSHELF, I->sr, 1681.97f, 0.7072f, 4.0f);
     bq_set(&S->k2, BQ_HP, I->sr, 38.135f, 0.5003f, 0);
-    S->blk = (unsigned)(I->sr * 0.1f);
+    S->blk = (unsigned)(I->sr * 0.01f);
 }
 static void loud_run(inst_t *I, float *const in[2], float *out[2], unsigned n) {
     loud_t *S = I->st;
     float target = I->c[1], maxcut = I->c[2];
-    float at = tc(150.f, I->sr), rt = tc(1500.f, I->sr), ceil_ = db2lin(-1.f), knee = ceil_ * 0.8f;
+    float at = tc(1.f, I->sr), rt = tc(1500.f, I->sr), ceil_ = db2lin(-1.f), knee = ceil_ * 0.8f;
+    double fa = 1.0 - tc(5.f, I->sr);
+    /* fast-detector power above which it starts cutting (dB -> mean square, undoing the -0.691) */
+    double fthr = pow(10.0, (target + LOUD_FAST_MARGIN + 0.691) / 10.0);
     for (unsigned i = 0; i < n; i++) {
+        double p = 0;
         for (int c = 0; c < 2; c++) {
             float k = bq_run(&S->k2, c, bq_run(&S->k1, c, in[c][i]));
-            S->acc += (double)k * k;
+            p += (double)k * k;
         }
+        S->acc += p;
+        S->fast += (p - S->fast) * fa;
         if (++S->cnt >= S->blk) {
-            S->blocks[S->bi] = S->acc / S->cnt;
-            S->bi = (S->bi + 1) & 3;
+            double blkms = S->acc / S->cnt;
+            S->sum += blkms - S->blocks[S->bi];
+            S->blocks[S->bi] = blkms;
+            S->bi = (S->bi + 1) % LOUD_NB;
             S->acc = 0; S->cnt = 0;
-            if (S->ready < 4) S->ready++;
-            double ms = 0;
-            for (int b = 0; b < S->ready; b++) ms += S->blocks[b];
-            ms /= S->ready;
-            float L = -0.691f + 10.f * log10f((float)ms + 1e-12f);
+            if (S->ready < LOUD_NB) S->ready++;
+            if (S->sum < 0) S->sum = 0;          /* float drift */
+            float L = -0.691f + 10.f * log10f((float)(S->sum / S->ready) + 1e-12f);
             S->want = L > target ? fminf(maxcut, L - target) : 0.f;
         }
-        S->gr = S->want + (S->gr - S->want) * (S->want > S->gr ? at : rt);
+        float want = S->want;
+        if (S->fast > fthr) {
+            /* E = how far the fast reading is over the target (> M here).  Nothing at the margin
+             * M, the full E from 2M up, a steep knee between: a big blast is cut completely at
+             * once while normal peaks just over the target are barely touched. */
+            float E = -0.691f + 10.f * log10f((float)S->fast) - target;
+            float cut = E >= 2.f * LOUD_FAST_MARGIN ? E : 2.f * (E - LOUD_FAST_MARGIN);
+            want = fmaxf(want, fminf(maxcut, cut));
+        }
+        S->gr = want + (S->gr - want) * (want > S->gr ? at : rt);
         float g = db2lin(-S->gr);
         for (int c = 0; c < 2; c++) {
             float y = in[c][i] * g, a = fabsf(y);
