@@ -49,6 +49,10 @@ LINK_LATENCY_MS = 5
 LINK_SETTLE = 0.4     # s a new loopback is held muted (it starts with a burst of garbage)
 
 
+SAFETY_POLL_MS = 10000   # re-sync with the sound server at least this often, even without events
+MIN_SYNC_S = 1.0         # ... and at most this often when events keep coming
+
+
 def pactl(*args, js=False):
     cmd = ["pactl"] + (["-f", "json"] if js else []) + [str(a) for a in args]
     try:
@@ -339,6 +343,66 @@ class Meters:
     def stop(self):
         for cid in list(self.procs):
             self._stop(cid)
+
+
+class PaEvents:
+    """`pactl subscribe`: calls on_change() when the sound server's devices, streams or modules change.
+    Lets the mixer re-sync only when something happened instead of polling pactl every couple of seconds.
+    Client events are ignored: every pactl call the mixer itself makes shows up as one."""
+    WATCH = (b" on sink", b" on source", b" on module", b" on server", b" on card")
+
+    def __init__(self, on_change):
+        self.on_change = on_change
+        self.proc = self.watch = None
+        self.buf = b""
+        self._start()
+
+    def _start(self):
+        self.watch = None
+        try:
+            self.proc = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL)
+        except OSError:
+            self.proc = None
+            return False
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.watch = GLib.io_add_watch(self.proc.stdout.fileno(), GLib.PRIORITY_DEFAULT,
+                                       GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._on_data)
+        return False
+
+    def _on_data(self, fd, _cond):
+        try:
+            data = os.read(fd, 65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            data = b""
+        if not data:                    # the sound server went away (or restarted): reconnect
+            self._reap()
+            GLib.timeout_add(2000, self._start)
+            self.on_change()
+            return False
+        lines = (self.buf + data).split(b"\n")
+        self.buf = lines.pop()
+        if any(w in ln for ln in lines for w in self.WATCH):
+            self.on_change()
+        return True
+
+    def _reap(self):
+        if self.proc:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=1)
+                self.proc.stdout.close()
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            self.proc = None
+
+    def stop(self):
+        if self.watch:
+            GLib.source_remove(self.watch)
+            self.watch = None
+        self._reap()
 
 
 def db_level(p):
@@ -1472,7 +1536,6 @@ class ControlServer:
       {"cmd":"duck","id":C,"on":...}               channel ducking on / off
       {"cmd":"soundboard","action":"play"|"stop"|"stop_all","id":ID}
       {"cmd":"profile","name":NAME}
-      {"cmd":"tuner"}                              open the tuner window
     Without "mix", a channel command changes the channel's master fader.
     Channels, mixes, sounds and profiles can be named by id or by (case-insensitive) name.
     """
@@ -1774,9 +1837,6 @@ class ControlServer:
                 return {"error": "no such profile"}
             win.switch_profile(name)
             return {"ok": True}
-        elif cmd == "tuner":
-            win.open_tuner()
-            return {"ok": True}
         else:
             return {"error": f"unknown cmd {cmd!r}"}
 
@@ -1796,7 +1856,7 @@ DECK_ACTIONS = [
     ("Audio · Channel", "channel"), ("Audio · Mix", "mix"), ("Audio · System sounds", "system"),
     ("Audio · Show / hide mixer", "window"), ("Audio · Effect on / off", "fx"),
     ("Audio · Ducking on / off", "duck"), ("Audio · Switch profile", "profile"),
-    ("Soundboard · Sound", "sound"), ("Tools · Tuner", "tuner"),
+    ("Soundboard · Sound", "sound"),
     ("System · Stat", "stat"), ("Media · Control", "media"),
     ("Deck · Change page", "page"), ("Launch · App", "app"), ("Launch · Website", "url"),
     ("Launch · Command", "command"), ("Empty", "empty")]
@@ -1816,7 +1876,8 @@ MEDIA_MODES = [("Play / pause", "playpause"), ("Next track", "next"), ("Previous
 PAGE_MODES = [("Next page", "next"), ("Previous page", "prev"), ("Go to page…", "goto")]
 SOUND_MODES = [("Play (layers on repeat)", "play"), ("Play / stop", "toggle"), ("Stop", "stop"),
                ("Stop all sounds", "stop_all")]
-NEW_ACTIONS = ("fx", "duck", "profile", "sound", "tuner")
+NEW_ACTIONS = ("fx", "duck", "profile", "sound")
+DECK_ACTION_IDS = {a for _label, a in DECK_ACTIONS} - {"empty"}
 
 
 def fx_choices(obj):
@@ -2190,7 +2251,7 @@ def deck_msg(key, ticks=0):
             return {"cmd": "duck", "id": key.get("channel"), "on": "toggle"} if key.get("channel") else None
         if act == "profile":
             return {"cmd": "profile", "name": key.get("profile")} if key.get("profile") else None
-        return {"cmd": "tuner"}
+        return None
     if act == "mix":
         target = key.get("mix")
         base = {"cmd": "mix", "id": target}
@@ -2221,7 +2282,7 @@ def deck_msg(key, ticks=0):
 
 def deck_view(key, st, deck):
     """Everything a key needs to draw itself. None means an empty key."""
-    if not key or key.get("action") in (None, "empty"):
+    if not key or key.get("action") not in DECK_ACTION_IDS:   # empty, or an action that was removed
         return None
     v = _deck_view(key, st, deck)
     if key.get("title"):
@@ -2307,8 +2368,6 @@ def _deck_view(key, st, deck):
         name = key.get("profile")
         cur = name and name == st.get("profile")
         return {"kind": "profile", "lines": [name or "Pick a", "current" if cur else "profile"], "on": bool(cur)}
-    if act == "tuner":
-        return {"kind": "tuner", "lines": ["Tuner", ""]}
     step = int(key.get("step") or 5)                     # channel / mix
     if act == "mix":
         m = next((x for x in st["mixes"] if x["id"] == key.get("mix")), None)
@@ -2757,8 +2816,6 @@ class DeckKey(Gtk.DrawingArea):
         elif kind in ("fx", "profile"):
             _glyph(cr, "power" if kind == "fx" else "chev-goto", w / 2, cy, 36,
                    (accent or BLUE) if v.get("on") else GREY)
-        elif kind == "tuner":
-            _glyph(cr, "fork", w / 2, cy, 36, tint)
         self._lines(cr, w, h, v)
 
     def _pixbuf(self, cr, pb, x, y, size):
@@ -3221,7 +3278,7 @@ class DeckView(Gtk.Box):
         def fill():
             clear(box)
             k = self.key(r, c) or {}
-            act = k.get("action") or "empty"
+            act = k.get("action") if k.get("action") in DECK_ACTION_IDS else "empty"
 
             def set_action(v):
                 defaults = {
@@ -3523,14 +3580,6 @@ class MixerWindow(Adw.ApplicationWindow):
                       self.stack.set_visible_child_name(k))
             navbox.append(b)
         side.append(navbox)
-        tuner_b = Gtk.Button(css_classes=["navbtn", "flat"], margin_start=6, margin_end=6,
-                             tooltip_text="Instrument tuner")
-        trow = Gtk.Box(spacing=12)
-        trow.append(Gtk.Image(icon_name=safe_icon("audio-input-microphone-symbolic")))
-        trow.append(Gtk.Label(label="Tuner"))
-        tuner_b.set_child(trow)
-        tuner_b.connect("clicked", lambda *_: self.open_tuner())
-        side.append(tuner_b)
         side.append(Gtk.Box(vexpand=True))
         quit_b = Gtk.Button(css_classes=["navbtn", "flat"], margin_start=6, margin_end=6,
                             tooltip_text="Stops routing and removes the virtual devices")
@@ -3554,11 +3603,15 @@ class MixerWindow(Adw.ApplicationWindow):
         split.set_content(self.stack)
         self._fx_refreshers = []       # callbacks that redraw open effect editors after a remote change
         self._duck_until = {}
-        self._tuner = None
 
         self.connect("close-request", self._on_close)
+        self.connect("notify::visible", lambda *_: self.sync_meters())   # meters only when someone looks
         self.rebuild_all()
-        GLib.timeout_add(2000, self._tick)
+        # Re-sync with the sound server when it reports a change (PaEvents), plus a slow safety poll.
+        self._sync_due = 0                       # pending event-driven sync (timeout id)
+        self._last_sync = time.monotonic()
+        self.pa_events = PaEvents(self._on_pa_event)
+        GLib.timeout_add(SAFETY_POLL_MS, self._tick)
         GLib.timeout_add(50, self._meter_tick)
         GLib.timeout_add(1000, self._stats_tick)
 
@@ -3769,18 +3822,6 @@ class MixerWindow(Adw.ApplicationWindow):
         self.soundboard_page.rebuild()
         self.toast("Configuration imported")
 
-    def open_tuner(self):
-        if self._tuner is not None:
-            self._tuner.present()
-            return
-        self._tuner = ext.TunerWindow(self)
-
-        def closed(*_):
-            self._tuner = None
-            return False
-        self._tuner.connect("close-request", closed)
-        self._tuner.present()
-
     def open_rack_window(self, obj):
         """The Creative Rack as its own window, to keep open next to whatever you play into."""
         w = Adw.Window(title=f"{obj['name']} — Creative Rack", default_width=520, default_height=760)
@@ -3858,12 +3899,12 @@ class MixerWindow(Adw.ApplicationWindow):
         return True
 
     def refresh_decks(self):
-        if not self.decks or not self.app.control:
-            return
+        shown = [d for d in self.decks if d.get_mapped()]
+        if not shown or not self.app.control:
+            return                                # don't build the whole state for nobody
         st = self.app.control.state()
-        for d in self.decks:
-            if d.get_mapped():
-                d.refresh(st)
+        for d in shown:
+            d.refresh(st)
 
     def _build_apps_page(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=8,
@@ -3912,7 +3953,14 @@ class MixerWindow(Adw.ApplicationWindow):
         self.rebuild_all()
 
     def sync_meters(self):
-        self.meters.sync(self.eng.meter_sources())
+        want = self.eng.meter_sources()
+        comp = self.app.companion
+        if not (self.get_visible() or (comp and comp.viewers)):
+            # nobody is looking: keep only the meters that drive ducking
+            need = {t for ch in self.cfg["channels"] if (ch.get("duck") or {}).get("on")
+                    for t in (ch.get("duck") or {}).get("by", []) if t != ch["id"]}
+            want = {k: v for k, v in want.items() if k in need}
+        self.meters.sync(want)
 
     def output_options(self):
         return [(s.get("description") or s["name"], s["name"]) for s in self.eng.hw_sinks]
@@ -4590,7 +4638,7 @@ class MixerWindow(Adw.ApplicationWindow):
                     if os.environ.get("AMX_DEBUG_SEARCH"):  # testing aid
                         search.set_text(os.environ["AMX_DEBUG_SEARCH"])
                     render()
-                    GLib.idle_add(search.grab_focus)
+                    GLib.idle_add(lambda: (search.grab_focus(), False)[1])   # one-shot (grab_focus returns True)
 
                     pbox.append(Gtk.Separator(margin_top=4, margin_bottom=4))
                     er = Gtk.Box(spacing=6)
@@ -4919,11 +4967,29 @@ class MixerWindow(Adw.ApplicationWindow):
             self.build_apps()
         self.sync_meters()
 
-    def _tick(self):
+    def _on_pa_event(self):
+        if self._sync_due:
+            return
+        # coalesce bursts, and sync at most every MIN_SYNC_S (ducking and fader moves cause events too)
+        wait = max(0.25, MIN_SYNC_S - (time.monotonic() - self._last_sync))
+        self._sync_due = GLib.timeout_add(int(wait * 1000), self._event_sync)
+
+    def _event_sync(self):
         if self._timers or self._dialog_open:
-            return True
+            return True                          # busy: try again shortly (same timer)
+        self._sync_due = 0
+        self._sync()
+        return False
+
+    def _sync(self):
+        self._last_sync = time.monotonic()
         self.eng.reconcile()
         self.refresh_dynamic()
+
+    def _tick(self):
+        if not (self._timers or self._dialog_open or self._sync_due) and \
+                time.monotonic() - self._last_sync >= SAFETY_POLL_MS / 1000 - 0.1:
+            self._sync()
         return True
 
     def _meter_tick(self):
@@ -5107,8 +5173,7 @@ class App(Adw.Application):
             self.board.stop_all()
         if self.win:
             self.win.meters.stop()
-            if self.win._tuner is not None:
-                self.win._tuner.stop()
+            self.win.pa_events.stop()
         if self.eng:
             self.eng.teardown()
             try:
@@ -5133,7 +5198,6 @@ CTL_HELP = """usage: {ctl} <command> [args]   (talks to the running mixer)
   mix-vol <mix> <0-100|+N|-N>   |  mix-mute <mix> [on|off|toggle]
   duck <channel> [on|off|toggle]
   profile <name>
-  tuner                              open the tuner window
   show | hide | toggle               the mixer window
   json '<object>'                    send a raw command (see ControlServer)
 """
@@ -5189,8 +5253,6 @@ def ctl_main(args):
             msg = {"cmd": "duck", "id": a[1], "on": onoff(a[2] if len(a) > 2 else None)}
         elif c == "profile":
             msg = {"cmd": "profile", "name": " ".join(a[1:])}
-        elif c == "tuner":
-            msg = {"cmd": "tuner"}
         elif c in ("show", "hide", "toggle"):
             msg = {"cmd": "window", "action": c}
         elif c == "json":

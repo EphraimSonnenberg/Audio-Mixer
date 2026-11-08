@@ -39,7 +39,7 @@ In a channel's **Channel settings**, turn on Ducking and choose which channels t
 
 ### Soundboard
 
-The **Soundboard** page holds pads with a name, a waveform, play/stop and a stable 4-digit id. Right-click a pad (or ⋯) to trim it on the waveform and set its own volume. Pressing a pad again layers another copy instead of cutting the first one off. The whole board plays into one channel you choose (or a new "Soundboard" channel), so the mixer decides who hears it: your headphones, the stream, or the microphone mix your friends hear. Sounds are copied into `~/.config/audio-mixer/sounds/`, and the whole board exports and imports as one `.zip` from **Settings ▸ Backups**. Needs `ffmpeg` for anything other than 16-bit WAV.
+The **Soundboard** page holds pads with a name, a waveform, play/stop and a stable 4-digit id. Right-click a pad (or ⋯) to trim it on the waveform and set its own volume. Pressing a pad again layers another copy instead of cutting the first one off. The whole board plays into one channel you choose (or a new "Soundboard" channel), so the mixer decides who hears it: your headphones, the stream, or the microphone mix your friends hear. Sounds are copied into `~/.config/audio-mixer/sounds/` (decoded copies are kept in `~/.cache/audio-mixer/pcm/` rather than in memory; safe to delete), and the whole board exports and imports as one `.zip` from **Settings ▸ Backups**. Needs `ffmpeg` for anything other than 16-bit WAV.
 
 ### Web Companion
 
@@ -61,9 +61,8 @@ A profile is a whole mixer setup: channels, levels, mutes, routing and effects. 
 - **Start at login** (Settings ▸ Startup): adds an autostart entry; by default it starts in the tray without opening the window. `audio-mixer --hidden` does the same by hand. If the mixer starts before PipeWire is ready, it waits for it instead of starting empty.
 - **Muting a microphone** channel mutes the microphone itself, so apps that record it directly (Discord, OBS, a browser) go silent too, not only the mixes. Unmuting it from the desktop (e.g. the mic-mute key) unmutes the channel, and quitting the mixer gives the microphone back unmuted. The mute next to a mix's level only affects that mix.
 - **Per-output levels**: each output device of a mix has its own volume and mute (headphones and speakers at once, at different levels).
-- **Instrument tuner** (sidebar ▸ Tuner): any input, chromatic or guitar / bass / ukulele / violin string modes (auto or a fixed string), adjustable concert pitch. Needs `numpy`.
 - **MIDI instrument**: a virtual channel can host a FluidSynth SoundFont (`.sf2`) that every MIDI keyboard plays (Channel settings ▸ MIDI instrument). Needs `fluidsynth` and a SoundFont.
-- **Deck keys** for all of this: play / stop a sound, switch an effect on or off, toggle ducking, switch profile, open the tuner.
+- **Deck keys** for all of this: play / stop a sound, switch an effect on or off, toggle ducking, switch profile.
 - **Command line** for keybinds and scripts, talking to the running mixer (`audio-mixer ctl …` when installed from the AUR):
 
   ```sh
@@ -72,7 +71,7 @@ A profile is a whole mixer setup: channels, levels, mutes, routing and effects. 
   python3 audio_mixer.py ctl fx-set Mic gate Threshold -50
   python3 audio_mixer.py ctl profile Streaming
   python3 audio_mixer.py ctl pan Music L30      # also R30, C, or -100..100
-  python3 audio_mixer.py ctl vol Music -5       # also: mute, mix-vol, mix-mute, duck, tuner, state
+  python3 audio_mixer.py ctl vol Music -5       # also: mute, mix-vol, mix-mute, duck, state
   ```
 
 The feature set follows [Waveline](https://github.com/Nakildias/Waveline). This is an independent implementation; no Waveline code is used.
@@ -82,9 +81,9 @@ The feature set follows [Waveline](https://github.com/Nakildias/Waveline). This 
 - PipeWire with `pipewire-pulse` (or PulseAudio), plus `pactl` and `parec`
 - Python 3.10+, PyGObject, GTK 4, libadwaita 1.5+, pycairo
 - For effects: `gcc` and `rnnoise` (without rnnoise everything except noise suppression works)
-- Optional: `ffmpeg` (soundboard formats), `numpy` (tuner), `fluidsynth` (MIDI instruments), KDE Plasma (KWin) for the deck's always-on-top and hide-from-taskbar options, `nvidia-smi` for NVIDIA GPU stats
+- Optional: `ffmpeg` (soundboard formats), `fluidsynth` (MIDI instruments), KDE Plasma (KWin) for the deck's always-on-top and hide-from-taskbar options, `nvidia-smi` for NVIDIA GPU stats
 
-Arch / CachyOS: `sudo pacman -S python-gobject gtk4 libadwaita python-cairo libpulse gcc rnnoise ffmpeg python-numpy fluidsynth`
+Arch / CachyOS: `sudo pacman -S python-gobject gtk4 libadwaita python-cairo libpulse gcc rnnoise ffmpeg fluidsynth`
 
 ## Install (Arch / CachyOS)
 
