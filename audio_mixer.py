@@ -4847,6 +4847,7 @@ class App(Adw.Application):
         self.control = None
         self.board = None
         self.companion = None
+        self.start_hidden = False
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -4920,6 +4921,9 @@ class App(Adw.Application):
             if dbg in ("mix", "chan"):
                 GLib.timeout_add(1500, lambda: self.win.open_dialog(
                     dbg, cfg["mixes"][0] if dbg == "mix" else cfg["channels"][2]) and False)
+            if self.start_hidden:           # first launch only; launching again opens the window
+                self.start_hidden = False
+                return
         self.win.present()
 
     def show_window(self):
@@ -5066,4 +5070,8 @@ def ctl_main(args):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "ctl":
         sys.exit(ctl_main(sys.argv[2:]))
-    sys.exit(App().run(sys.argv))
+    app = App()
+    if "--hidden" in sys.argv[1:]:          # start in the tray (used by the login autostart entry)
+        sys.argv.remove("--hidden")
+        app.start_hidden = True
+    sys.exit(app.run(sys.argv))

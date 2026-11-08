@@ -58,6 +58,7 @@ A profile is a whole mixer setup: channels, levels, mutes, routing and effects. 
 ### More
 
 - **Pan**: place any channel left or right (Channel settings ▸ Pan, double-click the value to centre). It applies in every mix. The near side stays at full level, so a centred channel is untouched.
+- **Start at login** (Settings ▸ Startup): adds an autostart entry; by default it starts in the tray without opening the window. `audio-mixer --hidden` does the same by hand.
 - **Per-output levels**: each output device of a mix has its own volume and mute (headphones and speakers at once, at different levels).
 - **Instrument tuner** (sidebar ▸ Tuner): any input, chromatic or guitar / bass / ukulele / violin string modes (auto or a fixed string), adjustable concert pitch. Needs `numpy`.
 - **MIDI instrument**: a virtual channel can host a FluidSynth SoundFont (`.sf2`) that every MIDI keyboard plays (Channel settings ▸ MIDI instrument). Needs `fluidsynth` and a SoundFont.
