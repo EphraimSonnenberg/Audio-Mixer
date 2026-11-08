@@ -30,6 +30,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FX_DIR = os.path.join(HERE, "fx")
 FX_SRC = os.path.join(FX_DIR, "amx_fx.c")
 FX_SO = os.path.join(FX_DIR, "amx_fx.so")
+if not os.access(FX_DIR, os.W_OK):
+    # System install (e.g. /usr/share/audio-mixer): use the packaged build if there is one,
+    # otherwise compile into the user's cache directory.
+    if not os.path.exists(FX_SO):
+        FX_SO = os.path.join(GLib.get_user_cache_dir(), "audio-mixer", "amx_fx.so")
+        os.makedirs(os.path.dirname(FX_SO), exist_ok=True)
 RUN_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "audio-mixer")
 PRESETS = os.path.join(GLib.get_user_config_dir(), "audio-mixer", "rack-presets.json")
 
@@ -38,7 +44,8 @@ PRESETS = os.path.join(GLib.get_user_config_dir(), "audio-mixer", "rack-presets.
 def ensure_built():
     """Compile fx/amx_fx.so if it is missing or older than its source. Returns (ok, message)."""
     try:
-        if os.path.exists(FX_SO) and os.path.getmtime(FX_SO) >= os.path.getmtime(FX_SRC):
+        if os.path.exists(FX_SO) and (os.path.getmtime(FX_SO) >= os.path.getmtime(FX_SRC)
+                                      or not os.access(os.path.dirname(FX_SO), os.W_OK)):
             return True, ""
     except OSError:
         return os.path.exists(FX_SO), "effects source missing"
