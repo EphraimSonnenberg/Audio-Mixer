@@ -72,6 +72,18 @@ def vol_of(d):
         return 0
 
 
+def pan_gains(pan):
+    """(left, right) gain for a pan of -100 (hard left) .. 0 (centre) .. 100 (hard right).
+    A balance law: the near side stays at unity, so a centred channel is untouched."""
+    p = max(-100.0, min(100.0, float(pan or 0))) / 100
+    return (1.0 - max(0.0, p), 1.0 + min(0.0, p))
+
+
+def pan_label(pan):
+    pan = round(pan or 0)
+    return "C" if pan == 0 else f"L {-pan}" if pan < 0 else f"R {pan}"
+
+
 def short_id():
     return uuid.uuid4().hex[:6]
 
@@ -534,6 +546,7 @@ class Engine:
     def chan(self, ch):
         ch.setdefault("vol", 100)
         ch.setdefault("mute", False)
+        ch.setdefault("pan", 0)
         ch.setdefault("apps", [])
         ch.setdefault("icon", guess_icon(ch["name"], ch["type"]))
         return ch
@@ -830,17 +843,23 @@ class Engine:
                     continue
                 want_gain = self.gain(mix, ch)
                 want_mute = bool(self.cell(mix, ch)["mute"] or ch["mute"])
+                pan = pan_gains(ch.get("pan", 0))
             else:                                   # mix -> one output device, with its own level
                 ol = (mix.get("out_levels") or {}).get(key[2]) or {}
                 want_mute = bool(mix["mute"] or ol.get("mute"))
                 want_gain = 0.0 if want_mute else mix["vol"] / 100 * ol.get("vol", 100) / 100
+                pan = (1.0, 1.0)
             if mod in self.fresh:                   # still settling: keep it silent
                 want_mute = True
-            want = round(want_gain * FULL)
-            if abs(vol_of(inp.get("volume")) - want) > 200:
-                pactl("set-sink-input-volume", inp["index"], want)
-                for v in inp["volume"].values():
-                    v["value"] = want
+            vols = inp.get("volume") or {}
+            # one value per stream channel, in channel-map order; left/right ones follow the pan
+            want = [round(want_gain * FULL * (pan[0] if "left" in pos else pan[1] if "right" in pos else 1.0))
+                    for pos in vols] or [round(want_gain * FULL)]
+            have = [v.get("value", 0) for v in vols.values()] or [0]
+            if len(have) != len(want) or any(abs(h - w) > 200 for h, w in zip(have, want)):
+                pactl("set-sink-input-volume", inp["index"], *want)
+                for v, w in zip(vols.values(), want):
+                    v["value"] = w
             if bool(inp.get("mute")) != want_mute:
                 pactl("set-sink-input-mute", inp["index"], int(want_mute))
                 inp["mute"] = want_mute
@@ -1391,6 +1410,7 @@ class ControlServer:
       {"cmd":"subscribe"}                       state now, then again on every change
       {"cmd":"state"}                           one-shot state
       {"cmd":"channel","id":C,["mix":M],...}    vol=N | delta=N, mute=true|false|"toggle", on=...
+                                                pan=-100..100 | pan_delta=N (channel only, no mix)
       {"cmd":"mix","id":M,...}                  vol / delta / mute
       {"cmd":"system","enable":true|false|"toggle"}
       {"cmd":"window","action":"show"|"hide"|"toggle"}
@@ -1528,7 +1548,7 @@ class ControlServer:
         return {
             "event": "state",
             "channels": [{"id": c["id"], "name": c["name"], "type": c["type"],
-                          "vol": eng.chan(c)["vol"], "mute": bool(c["mute"]),
+                          "vol": eng.chan(c)["vol"], "mute": bool(c["mute"]), "pan": c.get("pan", 0),
                           "system": bool(c.get("system")), "icon": c.get("icon")}
                          for c in cfg["channels"]],
             "mixes": [{"id": m["id"], "name": m["name"], "vol": m["vol"], "mute": bool(m["mute"]),
@@ -1611,6 +1631,14 @@ class ControlServer:
                 tgt["vol"] = new_vol(tgt["vol"])
             if "mute" in msg:
                 tgt["mute"] = new_bool(tgt["mute"], "mute")
+            if "pan" in msg or "pan_delta" in msg:
+                if cmd != "channel" or msg.get("mix"):
+                    return {"error": "pan is set per channel"}
+                try:
+                    v = float(msg["pan"]) if "pan" in msg else tgt.get("pan", 0) + float(msg["pan_delta"])
+                except (TypeError, ValueError):
+                    return {"error": "pan needs a number from -100 (left) to 100 (right)"}
+                tgt["pan"] = max(-100, min(100, round(v)))
         elif cmd == "system":
             cfg["system_default"] = new_bool(cfg.get("system_default", True), "enable")
             structural = True
@@ -4534,6 +4562,7 @@ class MixerWindow(Adw.ApplicationWindow):
                     label="Apps assigned to this channel are moved into it automatically. "
                           "You can also set the channel as the Default output to catch "
                           "everything else.", xalign=0, wrap=True, css_classes=["sub"]))
+            sp.append(self._pan_box(obj))
             sp.append(self._duck_box(obj))
             if obj["type"] == "virtual":
                 sp.append(self._midi_box(obj))
@@ -4607,6 +4636,42 @@ class MixerWindow(Adw.ApplicationWindow):
         registry.append(build)
         self._fx_refreshers.append(build)
         return holder
+
+    def _pan_box(self, obj):
+        """Left / right pan for the channel, applied in every mix."""
+        self.eng.chan(obj)
+        grp = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        row = Adw.ActionRow(title="Pan", subtitle="Place this channel left or right in every mix")
+        sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -100, 100, 1)
+        sc.set_value(obj.get("pan", 0))
+        sc.set_draw_value(False)
+        sc.add_css_class("plain")
+        sc.set_size_request(230, -1)
+        sc.set_valign(Gtk.Align.CENTER)
+        sc.add_mark(0, Gtk.PositionType.BOTTOM, None)
+        lab = Gtk.Label(label=pan_label(obj.get("pan", 0)), width_chars=6, xalign=1,
+                        css_classes=["sub", "numeric"])
+
+        def changed(s):
+            v = round(s.get_value())
+            if abs(v) <= 2:                       # snap to centre
+                v = 0
+            lab.set_label(pan_label(v))
+            if v != obj.get("pan", 0):
+                obj["pan"] = v
+                self.eng.apply_levels()
+                self.changed()
+        sc.connect("value-changed", changed)
+        g = Gtk.GestureClick()                    # double-click the value to centre
+        g.connect("pressed", lambda _g, n, *_: n == 2 and sc.set_value(0))
+        lab.add_controller(g)
+        lab.set_tooltip_text("Double-click to centre")
+        row.add_suffix(Gtk.Label(label="L", css_classes=["sub"]))
+        row.add_suffix(sc)
+        row.add_suffix(Gtk.Label(label="R", css_classes=["sub"]))
+        row.add_suffix(lab)
+        grp.append(row)
+        return grp
 
     def _duck_box(self, obj):
         d = obj.setdefault("duck", {})
@@ -4902,6 +4967,7 @@ CTL_HELP = """usage: audio_mixer.py ctl <command> [args]   (talks to the running
   fx-set <channel|mix> <effect> <param> <value>       e.g. fx-set Mic gate Threshold -50
   mute <channel> [mix] [on|off|toggle]
   vol <channel> <0-100|+N|-N> [mix]
+  pan <channel> <L N|R N|C|-100..100>                e.g. pan Music L30, pan Mic C
   mix-vol <mix> <0-100|+N|-N>   |  mix-mute <mix> [on|off|toggle]
   duck <channel> [on|off|toggle]
   profile <name>
@@ -4944,6 +5010,15 @@ def ctl_main(args):
             msg = dict({"cmd": "channel", "id": a[1]}, **vol(a[2]))
             if len(a) > 3:
                 msg["mix"] = a[3]
+        elif c == "pan":
+            v = "".join(a[2:]).strip().upper()
+            if v in ("C", "CENTER", "CENTRE"):
+                pan = 0
+            elif v[:1] in "LR" and v[1:].isdigit():
+                pan = int(v[1:]) * (-1 if v[0] == "L" else 1)
+            else:
+                pan = int(v)
+            msg = {"cmd": "channel", "id": a[1], "pan": pan}
         elif c == "mix-vol":
             msg = dict({"cmd": "mix", "id": a[1]}, **vol(a[2]))
         elif c == "mix-mute":

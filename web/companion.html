@@ -34,6 +34,12 @@ font:700 11px system-ui;letter-spacing:1px;padding:7px 0;box-shadow:inset 0 1px 
 .btn.mute.on{background:linear-gradient(#ff6b6b,#d63030);color:#200;box-shadow:0 0 10px rgba(255,77,77,.6)}
 .btn.duck.on{background:linear-gradient(#ffc966,#e09520);color:#221400}
 .btn.route{font-size:10px}.btn.route.on{background:linear-gradient(#5cc4ff,#2a8fd0);color:#04121c}
+.pan{position:relative;height:30px;flex:none;touch-action:none;cursor:ew-resize;background:#08090a;border:1px solid #000;
+border-radius:4px;overflow:hidden}
+.pan .mid{position:absolute;left:50%;top:0;bottom:0;width:1px;background:#3a3d43}
+.pan .bar{position:absolute;top:4px;height:6px;background:var(--acc);border-radius:2px}
+.pan .lr{position:absolute;bottom:3px;font:700 8px system-ui;color:#5d6269}
+.pan .val{position:absolute;left:0;right:0;bottom:2px;text-align:center;font:600 10px ui-monospace,monospace;color:var(--acc)}
 .fz{flex:1;display:flex;gap:4px;min-height:200px;position:relative}
 .scale{width:18px;position:relative;font-size:8px;color:#6c727a}
 .scale span{position:absolute;right:0;transform:translateY(50%)}
@@ -103,6 +109,15 @@ function inserts(id){const f=S.fx[id];if(!f)return '<div class="ins"></div>';
   const shown=on.slice(0,3).map(t=>`<div class="slot on">${esc(t)}</div>`).join('');
   return `<div class="ins">${shown}${on.length>3?`<div class="slot on">+${on.length-3}</div>`:''}<div class="slot more" data-sheet="${esc(id)}">FX ▾</div></div>`}
 
+const panTxt=v=>v==0?'C':(v<0?'L'+(-v):'R'+v);
+function panPot(c){const v=c.pan||0,a=50+Math.min(0,v)/2,w=Math.abs(v)/2;
+  return `<div class="pan" data-pan='${J({cmd:'channel',id:c.id})}' data-v="${v}" title="Pan · double-tap to centre">
+  <div class="mid"></div><div class="bar" style="left:${a}%;width:${w}%"></div>
+  <span class="lr" style="left:3px">L</span><span class="lr" style="right:3px">R</span>
+  <div class="val">${panTxt(v)}</div></div>`}
+function setPan(el,v){el.dataset.v=v;const b=el.querySelector('.bar');b.style.left=(50+Math.min(0,v)/2)+'%';
+  b.style.width=(Math.abs(v)/2)+'%';el.querySelector('.val').textContent=panTxt(v)}
+
 function chStrip(c,i){
   let v,mu,cmdBase,routed=true;
   if(layer=='main'){v=c.vol;mu=c.mute;cmdBase={cmd:'channel',id:c.id}}
@@ -112,6 +127,7 @@ function chStrip(c,i){
   ${inserts(c.id)}
   ${layer=='main'?`<button class="btn duck ${duck?'on':''}" data-cmd='${J({cmd:'duck',id:c.id,on:'toggle'})}'>DUCK</button>`
     :`<button class="btn route ${routed?'on':''}" data-cmd='${J({...cmdBase,on:'toggle'})}'>${routed?'SEND ON':'SEND OFF'}</button>`}
+  ${layer=='main'?panPot(c):''}
   <div class="fz">${scale()}${meter(c.id)}${fader(v,cmdBase)}</div>
   <div class="readout">${db(v)}</div>
   <button class="btn mute ${mu?'on':''}" data-cmd='${J({...cmdBase,mute:'toggle'})}'>MUTE</button>
@@ -196,6 +212,22 @@ document.addEventListener('pointerdown',e=>{
   const up=()=>{fd.removeEventListener('pointermove',move);fd.removeEventListener('pointerup',up);fd.removeEventListener('pointercancel',up);
     setTimeout(()=>{drag=0;render()},250)};
   fd.addEventListener('pointermove',move);fd.addEventListener('pointerup',up);fd.addEventListener('pointercancel',up)});
+
+// pan pots: drag sideways (relative), double-tap = centre
+let panPend=null,panTimer=null,panTap=0;
+function panFlush(){if(!panPend)return;const[el,v]=panPend;panPend=null;send(Object.assign(JSON.parse(el.dataset.pan),{pan:v}))}
+function panQueue(el,v){panPend=[el,v];if(panTimer)return;panFlush();
+  panTimer=setInterval(()=>{if(!panPend){clearInterval(panTimer);panTimer=null;return}panFlush()},50)}
+document.addEventListener('pointerdown',e=>{
+  const el=e.target.closest('.pan');if(!el)return;e.preventDefault();
+  const now=Date.now();if(now-panTap<300){panTap=0;setPan(el,0);panQueue(el,0);return}panTap=now;
+  el.setPointerCapture(e.pointerId);drag=1;
+  const x0=e.clientX,v0=+el.dataset.v,span=el.getBoundingClientRect().width;
+  const move=ev=>{let v=Math.round(v0+(ev.clientX-x0)/span*200);v=Math.max(-100,Math.min(100,v));
+    if(Math.abs(v)<=3)v=0;if(v!=+el.dataset.v){setPan(el,v);panQueue(el,v)}};
+  const up=()=>{el.removeEventListener('pointermove',move);el.removeEventListener('pointerup',up);el.removeEventListener('pointercancel',up);
+    setTimeout(()=>{drag=0;render()},250)};
+  el.addEventListener('pointermove',move);el.addEventListener('pointerup',up);el.addEventListener('pointercancel',up)});
 
 function sizeMeters(){document.querySelectorAll('.meter').forEach(m=>m.style.setProperty('--h',m.clientHeight+'px'));drawMeters()}
 function drawMeters(){const now=performance.now();
