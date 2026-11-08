@@ -366,6 +366,7 @@ class Engine:
         self.fresh = {}       # module id -> creation time (held muted for LINK_SETTLE seconds)
         self.retiring = {}    # module id -> (time to mute and unload it, its source)
         self._settle_timer = None
+        self.on_external_change = None   # called when the config changed from outside (UI refresh)
         self.cleanup_stale()
         self.fx = fxm.FxHost()
         self.fx_src = {}      # fid -> source name of a running effect chain
@@ -864,6 +865,39 @@ class Engine:
                 pactl("set-sink-input-mute", inp["index"], int(want_mute))
                 inp["mute"] = want_mute
         self.apply_mic_levels()        # a mix's virtual mic follows its fader too
+        self.apply_hw_mutes()
+
+    # ---- hardware input mute
+    def apply_hw_mutes(self, release_all=False):
+        """Muting a hardware input channel mutes the device itself, so apps that record it
+        directly (Discord, OBS, a browser) go silent too, not only the mixes. Only sources the
+        mixer muted are unmuted again; they are remembered in the config so a crash can't leave
+        a microphone muted for good."""
+        ours = self.cfg.setdefault("_hw_muted", [])
+        want = set() if release_all else {
+            c.get("source") for c in self.cfg["channels"]
+            if c.get("type") == "hw" and c.get("mute") and c.get("source")}
+        for s in self.sources:
+            name = s.get("name")
+            if name in want and name in ours and not s.get("mute"):
+                # we muted it and something else (the desktop's mic key, pavucontrol) unmuted
+                # it: follow that instead of muting it again behind the user's back
+                for c in self.cfg["channels"]:
+                    if c.get("type") == "hw" and c.get("source") == name:
+                        c["mute"] = False
+                ours.remove(name)
+                if self.on_external_change:
+                    self.on_external_change()
+            elif name in want and not s.get("mute"):
+                if pactl("set-source-mute", name, 1) is not None:
+                    s["mute"] = True
+                    if name not in ours:
+                        ours.append(name)
+            elif name in ours and name not in want:
+                if s.get("mute") and pactl("set-source-mute", name, 0) is not None:
+                    s["mute"] = False
+                ours.remove(name)
+        # a muted source that is unplugged stays listed, so it is unmuted when it comes back
 
     # ---- virtual microphones
     def apply_mic_levels(self):
@@ -1006,6 +1040,7 @@ class Engine:
     def teardown(self):
         self.restore_default()
         self.restore_default_source()
+        self.apply_hw_mutes(release_all=True)    # give the user their microphones back
         for mid, *_ in list(self.links.values()):
             self._unload(mid)
         for mid in list(self.retiring):
@@ -1067,14 +1102,30 @@ def default_config(eng):
     })
 
 
+CONFIG_PROBLEM = None   # set when config.json couldn't be read; shown to the user on start
+
+
 def load_config():
+    global CONFIG_PROBLEM
     try:
         with open(CONF) as f:
             cfg = json.load(f)
-        if cfg.get("channels") is not None and cfg.get("mixes"):
+        if isinstance(cfg, dict) and cfg.get("channels") is not None and cfg.get("mixes"):
             return normalize(cfg)
-    except (OSError, ValueError):
-        pass
+        problem = "it has no channels or mixes"
+    except FileNotFoundError:
+        return None                           # first run
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+        problem = str(e) or type(e).__name__
+    # Unreadable: keep it instead of silently overwriting the user's setup with defaults.
+    keep = CONF + time.strftime(".broken-%Y%m%d-%H%M%S")
+    try:
+        os.replace(CONF, keep)
+        CONFIG_PROBLEM = (f"Your settings file couldn't be read ({problem}), so the mixer started "
+                          f"with a fresh setup. The old file was kept as {keep}.")
+    except OSError:
+        CONFIG_PROBLEM = f"Your settings file couldn't be read ({problem}); started with a fresh setup."
+    print(CONFIG_PROBLEM, file=sys.stderr)
     return None
 
 
@@ -3513,6 +3564,15 @@ class MixerWindow(Adw.ApplicationWindow):
 
     def _on_close(self, *_):
         self.set_visible(False)  # keep routing alive in the background
+        tray = getattr(self.app, "tray", None)
+        if not (tray and tray.ok) and not self.cfg.get("bg_notice_shown"):
+            # no tray icon to bring it back from: say once where it went
+            self.cfg["bg_notice_shown"] = True
+            self.changed()
+            n = Gio.Notification.new("Audio Mixer is still running")
+            n.set_body("It keeps your audio routed in the background. Open it again from the app "
+                       "menu; use “Quit mixer” in the sidebar to stop it.")
+            self.app.send_notification("background", n)
         return True
 
     # ---- page skeletons
@@ -3525,6 +3585,8 @@ class MixerWindow(Adw.ApplicationWindow):
         self.default_box = Gtk.Box()
         top.append(self.default_box)
         page.append(top)
+        self.hint_box = Gtk.Box()
+        page.append(self.hint_box)
         self.grid = Gtk.Grid(column_spacing=8, row_spacing=8, valign=Gtk.Align.START)
         sw = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
         sw.set_child(self.grid)
@@ -3767,6 +3829,12 @@ class MixerWindow(Adw.ApplicationWindow):
         if getattr(self, "_toasts", None) is not None:
             self._toasts.add_toast(Adw.Toast(title=text, timeout=2))
 
+    def notice(self, heading, body):
+        """Something the user has to read (not a 2-second toast)."""
+        dlg = Adw.AlertDialog(heading=heading, body=body)
+        dlg.add_response("ok", "OK")
+        dlg.present(self)
+
     def deck_page_changed(self):
         for d in self.decks:
             d.build_pagebar()
@@ -3915,7 +3983,35 @@ class MixerWindow(Adw.ApplicationWindow):
         row.append(sw)
         self.default_box.append(row)
 
+    def build_hint(self):
+        """First-run help, until an app has been given a channel (or it is dismissed)."""
+        clear(self.hint_box)
+        if self.cfg.get("hint_dismissed") or any(c.get("apps") for c in self.cfg["channels"]):
+            return
+        bar = Gtk.Box(spacing=12, css_classes=["cell"], hexpand=True)
+        bar.append(Gtk.Image(icon_name="dialog-information-symbolic", valign=Gtk.Align.START))
+        bar.append(Gtk.Label(
+            label="<b>Getting started</b>\n"
+                  "1. Play something, then open <b>Apps</b> and send each app to a channel "
+                  "(Games, Music, …). Anything you don't assign plays through <b>System</b>.\n"
+                  "2. Click a mix's name to choose where it plays: headphones, speakers, or a "
+                  "virtual microphone for Discord / OBS.\n"
+                  "3. Each row's slider is that channel's level in that mix. Click a channel for "
+                  "effects, panning and ducking. Add a microphone from <b>Your devices</b>.",
+            use_markup=True, wrap=True, xalign=0, hexpand=True))
+        close = Gtk.Button(icon_name="window-close-symbolic", css_classes=["flat"],
+                           valign=Gtk.Align.START, tooltip_text="Hide this")
+
+        def dismiss(_b):
+            self.cfg["hint_dismissed"] = True
+            self.changed()
+            self.build_hint()
+        close.connect("clicked", dismiss)
+        bar.append(close)
+        self.hint_box.append(bar)
+
     def build_matrix(self):
+        self.build_hint()
         clear(self.grid)
         self.refs = []
         eng, cfg = self.eng, self.cfg
@@ -4005,7 +4101,11 @@ class MixerWindow(Adw.ApplicationWindow):
             ch["vol"] = v
             self.changed()
             self.schedule("levels", 40, self.eng.apply_levels)
-        row.append(mute_button(ch["mute"], set_mute))
+        mb = mute_button(ch["mute"], set_mute)
+        mb.set_tooltip_text("Mute this microphone everywhere: in every mix and in apps that use it "
+                            "directly (Discord, OBS, …)" if ch["type"] == "hw"
+                            else "Mute this channel in every mix")
+        row.append(mb)
         row.append(fader(ch["vol"], set_vol,
                          lambda: 0.0 if ch["mute"] else db_level(self.meters.level.get(ch["id"], 0)),
                          self.refs))
@@ -4848,6 +4948,7 @@ class App(Adw.Application):
         self.board = None
         self.companion = None
         self.start_hidden = False
+        self._wait_win = self._wait_page = self._wait_timer = None
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -4870,6 +4971,8 @@ class App(Adw.Application):
 
     def do_activate(self):
         if not self.win:
+            if not self._audio_ready():
+                return
             eng = Engine({"channels": [], "mixes": []})
             eng.refresh()
             cfg = load_config() or default_config(eng)
@@ -4882,7 +4985,12 @@ class App(Adw.Application):
             self.companion = ext.Companion(self)
             kwin_cleanup_stale()
             self.win = MixerWindow(self, eng)
+            eng.on_external_change = lambda w=self.win: (w.changed(),
+                                                         w.schedule("matrix", 150, w.build_matrix))
             self.win.sync_meters()
+            if CONFIG_PROBLEM:
+                GLib.timeout_add(800, lambda: self.win.notice("Settings were reset", CONFIG_PROBLEM)
+                                 and False)
             if (cfg.get("deck_window") or {}).get("open"):
                 GLib.idle_add(lambda: (self.win.open_deck_window(), False)[1])
             self.tray = Tray(self.toggle_window, self.show_window, self.shutdown,
@@ -4909,8 +5017,12 @@ class App(Adw.Application):
             out = os.environ.get("AMX_DEBUG_WINSNAP")
             if out:
                 def snap():
-                    w = self.win.get_content()
+                    w = self.win                        # whole window: dialogs too
                     sn = Gtk.Snapshot()
+                    from gi.repository import Graphene
+                    bg = Gdk.RGBA()
+                    bg.parse("#242424")                 # the window background isn't in the paintable
+                    sn.append_color(bg, Graphene.Rect().init(0, 0, w.get_width(), w.get_height()))
                     Gtk.WidgetPaintable.new(w).snapshot(sn, w.get_width(), w.get_height())
                     tex = self.win.get_native().get_renderer().render_texture(sn.to_node(), None)
                     tex.save_to_png(out)
@@ -4925,6 +5037,48 @@ class App(Adw.Application):
                 self.start_hidden = False
                 return
         self.win.present()
+
+    # ---- waiting for the audio server (e.g. started at login before PipeWire is up)
+    def _audio_ready(self):
+        """True when the sound server answers. Otherwise show why (unless starting hidden) and
+        retry every second; activation continues by itself once it is up."""
+        if shutil.which("pactl") and pactl("info") is not None:
+            if self._wait_win:
+                self._wait_win.destroy()
+                self._wait_win = None
+            return True
+        if not shutil.which("pactl"):
+            title, desc = ("pactl is missing",
+                           "The mixer controls your sound through pactl. Install it (on Arch: "
+                           "sudo pacman -S libpulse), then start the mixer again.")
+        else:
+            title, desc = ("Waiting for the sound server…",
+                           "PipeWire (with pipewire-pulse) or PulseAudio isn't answering yet. "
+                           "The mixer starts as soon as it does.\n\nIf this doesn't go away, "
+                           "check that pipewire-pulse is installed and running:\n"
+                           "systemctl --user status pipewire-pulse")
+        if not self.start_hidden:
+            if not self._wait_win:
+                self._wait_win = Adw.ApplicationWindow(application=self, title="Audio Mixer",
+                                                       default_width=560, default_height=420)
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                box.append(Adw.HeaderBar())
+                self._wait_page = Adw.StatusPage(icon_name="audio-speakers-symbolic", vexpand=True)
+                box.append(self._wait_page)
+                self._wait_win.set_content(box)
+                self._wait_win.connect("close-request", lambda *_: (self.quit(), False)[1])
+            self._wait_page.set_title(title)
+            self._wait_page.set_description(desc)
+            self._wait_win.present()
+        if not self._wait_timer:
+            def retry():
+                if shutil.which("pactl") and pactl("info") is not None:
+                    self._wait_timer = None
+                    self.activate()
+                    return False
+                return True
+            self._wait_timer = GLib.timeout_add(1000, retry)
+        return False
 
     def show_window(self):
         if self.win:
@@ -4957,11 +5111,15 @@ class App(Adw.Application):
                 self.win._tuner.stop()
         if self.eng:
             self.eng.teardown()
+            try:
+                save_config(self.eng.cfg)     # teardown released the microphones it had muted
+            except OSError:
+                pass
         self.quit()
         return False
 
 
-CTL_HELP = """usage: audio_mixer.py ctl <command> [args]   (talks to the running mixer)
+CTL_HELP = """usage: {ctl} <command> [args]   (talks to the running mixer)
 
   state                              print the mixer state as JSON
   play <sound>  |  stop <sound>  |  stop-all          soundboard (sound = 4-digit id or name)
@@ -5038,10 +5196,10 @@ def ctl_main(args):
         elif c == "json":
             msg = json.loads(a[1])
         else:
-            print(CTL_HELP, end="")
+            print(CTL_HELP.format(ctl=ext.ctl_hint()), end="")
             return 0 if c in ("help", "-h", "--help") else 2
     except (IndexError, ValueError):
-        print(CTL_HELP, end="")
+        print(CTL_HELP.format(ctl=ext.ctl_hint()), end="")
         return 2
     path = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "audio-mixer.sock")
     try:
