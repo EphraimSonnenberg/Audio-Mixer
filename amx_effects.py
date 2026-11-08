@@ -406,15 +406,22 @@ class FxHost:
         p = self.procs.get(fid)
         return bool(p) and p["proc"].poll() is None
 
-    def sync(self, wanted):
+    def sync(self, wanted, sources=None):
         """wanted: fid -> {"nodes", "shape", "target", "capture_sink", "desc"}.
+        sources: the server's current source names. A chain that is running but whose source is
+        missing (e.g. PipeWire restarted under it: the process lives on, disconnected) is restarted.
         Starts / restarts / stops processes. Returns the fids that were (re)started.
         A chain being replaced is not stopped here: it keeps playing (in self.old) until the
         mixer has switched its links over to the new one and calls reap()."""
         started = []
+        now = time.time()
         for fid in list(self.procs):
             p, w = self.procs[fid], wanted.get(fid)
-            if p["proc"].poll() is not None:          # crashed: count it against this shape
+            published = sources is not None and f"amx_fx_{p['tag']}" in sources
+            lost = sources is not None and not published and now - p["t"] > 4
+            if published and now - p["t"] > 30:
+                self.fails.pop(fid, None)             # healthy for a while: forget old failures
+            if p["proc"].poll() is not None or lost:  # crashed / cut off: count it against this shape
                 shp, n = self.fails.get(fid, (None, 0))
                 self.fails[fid] = (p["shape"], n + 1 if shp == p["shape"] else 1)
                 self._stop(fid)

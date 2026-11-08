@@ -796,7 +796,7 @@ class Engine:
     def sync_fx(self, sink_names, src_names):
         wanted = {fid: w for fid, w in self.fx_wanted().items()
                   if w["target"] in (sink_names if w["capture_sink"] else src_names)}
-        started = self.fx.sync(wanted)
+        started = self.fx.sync(wanted, src_names)
         if started:                      # wait for the new chains' sources before linking them
             names = {self.fx.source(fid) for fid in started}
             deadline = time.time() + 2.5
