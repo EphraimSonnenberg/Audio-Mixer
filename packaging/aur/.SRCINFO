@@ -1,6 +1,6 @@
 pkgbase = audio-mixer-git
 	pkgdesc = Wave Link style software audio mixer for PipeWire with a virtual Stream Deck, effects and soundboard
-	pkgver = r4.8b97f41
+	pkgver = r16.11961e3
 	pkgrel = 1
 	url = https://github.com/coolguy1333/Audio-Mixer
 	install = audio-mixer-git.install

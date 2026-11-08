@@ -1,7 +1,7 @@
 # Maintainer: coolguy1333
 pkgname=audio-mixer-git
 _pkgname=audio-mixer
-pkgver=r4.8b97f41
+pkgver=r16.11961e3
 pkgrel=1
 pkgdesc="Wave Link style software audio mixer for PipeWire with a virtual Stream Deck, effects and soundboard"
 arch=('x86_64' 'aarch64')
