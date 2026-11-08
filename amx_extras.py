@@ -467,7 +467,7 @@ class SoundboardPage(Gtk.Box):
         self.append(Gtk.Label(
             label="Click a pad to play it (again to layer another copy); right-click or ⋯ to trim it. Each sound "
                   "has a 4-digit id for Stream Deck buttons and the command line: "
-                  "audio_mixer.py ctl play <id>.", xalign=0, wrap=True, css_classes=["sub"]))
+                  f"{ctl_hint()} play <id>.", xalign=0, wrap=True, css_classes=["sub"]))
         self.routing = Gtk.Box(spacing=12, css_classes=["cell"])
         self.append(self.routing)
         sw = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
@@ -998,6 +998,26 @@ class TunerWindow(Adw.Window):
         cr.show_text(sub)
 
 
+# =========================================================================== how to run the mixer
+def installed():
+    """True for the packaged install (/usr/share/audio-mixer with an `audio-mixer` command)."""
+    return os.path.dirname(os.path.abspath(__file__)) == "/usr/share/audio-mixer" \
+        and bool(shutil.which("audio-mixer"))
+
+
+def run_command():
+    """The command that starts this mixer, for showing to the user and for autostart."""
+    if installed():
+        return "audio-mixer"
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_mixer.py")
+    return 'python3 "{}"'.format(script.replace("\\", "\\\\").replace('"', '\\"'))
+
+
+def ctl_hint():
+    """Short form of the control command for help texts."""
+    return "audio-mixer ctl" if installed() else "python3 audio_mixer.py ctl"
+
+
 # =========================================================================== start at login
 AUTOSTART_FILE = os.path.join(GLib.get_user_config_dir(), "autostart", "io.github.lawsonf.AudioMixer.desktop")
 
@@ -1014,12 +1034,7 @@ def set_autostart(on, hidden=True):
         except FileNotFoundError:
             pass
         return
-    here = os.path.dirname(os.path.abspath(__file__))
-    if here == "/usr/share/audio-mixer" and shutil.which("audio-mixer"):
-        cmd = "audio-mixer"                       # installed package
-    else:                                         # running from a checkout
-        script = os.path.join(here, "audio_mixer.py").replace("\\", "\\\\").replace('"', '\\"')
-        cmd = f'python3 "{script}"'
+    cmd = run_command()
     if hidden:
         cmd += " --hidden"
     os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)

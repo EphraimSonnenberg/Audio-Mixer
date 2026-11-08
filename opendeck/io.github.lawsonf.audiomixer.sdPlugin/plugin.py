@@ -392,14 +392,25 @@ class Plugin:
 
     @staticmethod
     def launch_mixer():
+        # the installed package's command, else its menu entry, else a checkout of the repo
+        desktop = any(os.path.exists(os.path.join(d, "applications", "io.github.lawsonf.AudioMixer.desktop"))
+                      for d in [os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")]
+                      + (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":"))
+        if shutil.which("audio-mixer"):
+            cmd = ["audio-mixer"]
+        elif desktop and shutil.which("gtk-launch"):
+            cmd = ["gtk-launch", "io.github.lawsonf.AudioMixer"]
+        else:
+            script = next((p for p in (os.path.expanduser(x) for x in (
+                "~/Projects/audio-mixer/audio_mixer.py", "~/audio-mixer/audio_mixer.py",
+                "~/Audio-Mixer/audio_mixer.py")) if os.path.exists(p)), None)
+            if not script:
+                log("could not launch the mixer: install the audio-mixer package or start it once")
+                return
+            cmd = [sys.executable, script]
         try:
-            if shutil.which("gtk-launch"):
-                subprocess.Popen(["gtk-launch", "io.github.lawsonf.AudioMixer"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                script = os.path.expanduser("~/audio-mixer/audio_mixer.py")
-                subprocess.Popen([sys.executable, script], stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
         except OSError as e:
             log("could not launch the mixer:", e)
 

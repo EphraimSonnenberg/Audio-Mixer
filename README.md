@@ -58,12 +58,13 @@ A profile is a whole mixer setup: channels, levels, mutes, routing and effects. 
 ### More
 
 - **Pan**: place any channel left or right (Channel settings ▸ Pan, double-click the value to centre). It applies in every mix. The near side stays at full level, so a centred channel is untouched.
-- **Start at login** (Settings ▸ Startup): adds an autostart entry; by default it starts in the tray without opening the window. `audio-mixer --hidden` does the same by hand.
+- **Start at login** (Settings ▸ Startup): adds an autostart entry; by default it starts in the tray without opening the window. `audio-mixer --hidden` does the same by hand. If the mixer starts before PipeWire is ready, it waits for it instead of starting empty.
+- **Muting a microphone** channel mutes the microphone itself, so apps that record it directly (Discord, OBS, a browser) go silent too, not only the mixes. Unmuting it from the desktop (e.g. the mic-mute key) unmutes the channel, and quitting the mixer gives the microphone back unmuted. The mute next to a mix's level only affects that mix.
 - **Per-output levels**: each output device of a mix has its own volume and mute (headphones and speakers at once, at different levels).
 - **Instrument tuner** (sidebar ▸ Tuner): any input, chromatic or guitar / bass / ukulele / violin string modes (auto or a fixed string), adjustable concert pitch. Needs `numpy`.
 - **MIDI instrument**: a virtual channel can host a FluidSynth SoundFont (`.sf2`) that every MIDI keyboard plays (Channel settings ▸ MIDI instrument). Needs `fluidsynth` and a SoundFont.
 - **Deck keys** for all of this: play / stop a sound, switch an effect on or off, toggle ducking, switch profile, open the tuner.
-- **Command line** for keybinds and scripts, talking to the running mixer:
+- **Command line** for keybinds and scripts, talking to the running mixer (`audio-mixer ctl …` when installed from the AUR):
 
   ```sh
   python3 audio_mixer.py ctl play 4821          # soundboard (also: stop, toggle, stop-all)
@@ -115,7 +116,9 @@ Categories=AudioVideo;Audio;Mixer;
 
 Then copy `assets/io.github.lawsonf.AudioMixer.svg` to `~/.local/share/icons/hicolor/scalable/apps/`.
 
-Settings are saved in `~/.config/audio-mixer/config.json`. Quitting from the tray or sidebar removes all virtual devices and restores your default output and microphone.
+Settings are saved in `~/.config/audio-mixer/config.json`. If that file is ever damaged, the mixer keeps it as `config.json.broken-<date>`, starts with a fresh setup and tells you. Quitting from the tray or sidebar removes all virtual devices and restores your default output and microphone.
+
+Closing the window keeps the mixer running so your audio stays routed. Without a system tray, open it again from the app menu.
 
 ## OpenDeck plugin
 
