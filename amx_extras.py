@@ -1,5 +1,6 @@
-"""Audio Mixer extras: Soundboard, Web Companion, Profiles, Tuner, MIDI instruments, Settings page."""
+"""Audio Mixer extras: Soundboard, Web Companion, Profiles, MIDI instruments, Settings page."""
 import copy
+import hashlib
 import http.server
 import json
 import math
@@ -21,14 +22,12 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-try:
-    import numpy as np
-except ImportError:      # the tuner needs numpy; the soundboard works without it (slower)
-    np = None
-
 CONF_DIR = os.path.join(GLib.get_user_config_dir(), "audio-mixer")
 SOUNDS_DIR = os.path.join(CONF_DIR, "sounds")
+PCM_CACHE = os.path.join(GLib.get_user_cache_dir(), "audio-mixer", "pcm")   # decoded clips, read on play
 RATE = 48000
+FRAME = 8              # bytes per frame: float32 stereo
+PEAK_RES = 2048        # waveform buckets kept in memory per clip
 
 
 def _clear(box):
@@ -106,8 +105,10 @@ class Soundboard:
 
     def __init__(self, app):
         self.app = app
-        self._pcm = {}        # sid -> ((path, mtime), samples)
-        self._peaks = {}      # (sid, n, start, end) -> list
+        # sid -> {"key", "path", "frames", "peaks"}. The decoded audio itself stays on disk (PCM_CACHE),
+        # so memory holds only a small peak array per clip, not the whole clip.
+        self._meta = {}
+        self._peaks = {}      # (sid, n, buckets) -> normalised list for drawing
         self.playing = {}     # sid -> [(proc, t0, dur)]
         self._lock = threading.Lock()
 
@@ -129,20 +130,22 @@ class Soundboard:
 
     # ---- audio data
     @staticmethod
-    def _decode(path):
+    def _decode_to(path, dest):
+        """Decode `path` to raw float32 stereo at RATE in file `dest`. True on success."""
         if shutil.which("ffmpeg"):
             try:
-                r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-f", "f32le", "-ac", "2",
-                                    "-ar", str(RATE), "pipe:1"], capture_output=True, timeout=120)
-                if r.returncode == 0 and r.stdout:
-                    return r.stdout
+                r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path, "-f", "f32le",
+                                    "-ac", "2", "-ar", str(RATE), dest], timeout=120,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if r.returncode == 0 and os.path.getsize(dest) > 0:
+                    return True
             except (OSError, subprocess.TimeoutExpired):
                 pass
         try:                                   # plain 16-bit WAV without ffmpeg
             import wave
             with wave.open(path) as w:
                 if w.getsampwidth() != 2:
-                    return None
+                    return False
                 raw = array("h")
                 raw.frombytes(w.readframes(w.getnframes()))
                 ch, sr = w.getnchannels(), w.getframerate()
@@ -157,67 +160,106 @@ class Soundboard:
                 out.append(left)
                 out.append(right)
                 i += step
-            return out.tobytes()
+            with open(dest, "wb") as fh:
+                out.tofile(fh)
+            return len(out) > 0
         except Exception:
-            return None
+            return False
 
-    def pcm(self, s):
-        """float32 interleaved stereo samples (numpy array, or array('f'))."""
+    @staticmethod
+    def _scan_peaks(path, frames):
+        """Max |sample| per bucket, PEAK_RES buckets (fewer for very short clips), read in chunks."""
+        per = max(1, frames // PEAK_RES)
+        n = min(PEAK_RES, frames // per)
+        pk = array("f")
+        step = max(1, (1 << 18) // (per * FRAME)) * per          # whole buckets per read, ~256 KB
+        with open(path, "rb") as fh:
+            while len(pk) < n:
+                buf = array("f")
+                buf.frombytes(fh.read(min(step, (n - len(pk)) * per) * FRAME))
+                if not buf:
+                    break
+                for i in range(0, len(buf), per * 2):
+                    seg = buf[i:i + per * 2]
+                    pk.append(max(max(seg), -min(seg)))
+        return pk
+
+    def _entry(self, s):
+        """The decoded clip's cache entry, decoding it on first use. None if it can't be decoded."""
         try:
-            key = (s["file"], os.path.getmtime(s["file"]))
+            st = os.stat(s["file"])
         except OSError:
             return None
+        key = (s["file"], st.st_mtime_ns)
         with self._lock:
-            hit = self._pcm.get(s["id"])
-        if hit and hit[0] == key:
-            return hit[1]
-        raw = self._decode(s["file"])
-        if raw is None:
+            hit = self._meta.get(s["id"])
+        if hit and hit["key"] == key:
+            return hit
+        os.makedirs(PCM_CACHE, exist_ok=True)
+        stem = hashlib.sha1(os.path.abspath(s["file"]).encode()).hexdigest()[:20]
+        base = os.path.join(PCM_CACHE, f"{stem}-{st.st_mtime_ns}")
+        pcm, pkf = base + ".f32", base + ".peaks"
+        try:
+            if not os.path.exists(pcm):
+                tmp = f"{pcm}.{os.getpid()}.{threading.get_ident()}.tmp"
+                ok = self._decode_to(s["file"], tmp)
+                if not ok:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    return None
+                os.replace(tmp, pcm)
+                for f in os.listdir(PCM_CACHE):        # older decodes of the same file
+                    if f.startswith(stem + "-") and not f.startswith(os.path.basename(base)):
+                        try:
+                            os.unlink(os.path.join(PCM_CACHE, f))
+                        except OSError:
+                            pass
+            frames = os.path.getsize(pcm) // FRAME
+            pk = array("f")
+            try:
+                with open(pkf, "rb") as fh:
+                    pk.frombytes(fh.read())
+            except OSError:
+                pk = self._scan_peaks(pcm, frames)
+                with open(pkf + ".tmp", "wb") as fh:
+                    pk.tofile(fh)
+                os.replace(pkf + ".tmp", pkf)
+        except OSError:
             return None
-        if np is not None:
-            data = np.frombuffer(raw, dtype=np.float32)
-        else:
-            data = array("f")
-            data.frombytes(raw)
+        e = {"key": key, "path": pcm, "frames": frames, "peaks": pk}
         with self._lock:
-            self._pcm[s["id"]] = (key, data)
-        return data
-
-    def cached(self, s):
-        hit = self._pcm.get(s["id"])
-        return hit[1] if hit else None
+            self._meta[s["id"]] = e
+        return e
 
     def preload(self, sounds, done):
         def work():
             for s in sounds:
-                self.pcm(s)
-                GLib.idle_add(done, s["id"])
+                self._entry(s)
+                # one-shot: an idle callback that returns anything truthy is re-run forever
+                GLib.idle_add(lambda sid=s["id"]: (done(sid), False)[1])
         threading.Thread(target=work, daemon=True).start()
 
     def duration(self, s):
-        d = self.cached(s)
-        return len(d) / 2 / RATE if d is not None else 0.0
+        e = self._meta.get(s["id"])
+        return e["frames"] / RATE if e else 0.0
 
     def peaks(self, s, n):
-        d = self.cached(s)
-        if d is None or not len(d):
+        e = self._meta.get(s["id"])
+        if not e or not e["peaks"]:
             return None
-        key = (s["id"], n, len(d))
+        src = e["peaks"]
+        m = len(src)
+        key = (s["id"], n, m, e["key"])
         if key in self._peaks:
             return self._peaks[key]
-        frames = len(d) // 2
-        per = max(1, frames // n)
-        if np is not None:
-            mono = np.abs(d[: frames * 2].reshape(-1, 2)).max(axis=1)
-            mono = mono[: per * (frames // per)].reshape(-1, per).max(axis=1)
-            out = [float(x) for x in mono[:n]]
+        if m <= n:
+            out = list(src)
         else:
-            out = []
-            for i in range(min(n, frames // per)):
-                seg = d[i * per * 2:(i + 1) * per * 2]
-                out.append(max(max(seg), -min(seg)) if seg else 0.0)
-        top = max(out) if out else 1
+            out = [max(src[i * m // n:max((i + 1) * m // n, i * m // n + 1)]) for i in range(n)]
+        top = max(out)
         out = [x / top if top > 0 else 0 for x in out]
+        if len(self._peaks) > 256:
+            self._peaks.clear()
         self._peaks[key] = out
         return out
 
@@ -231,18 +273,13 @@ class Soundboard:
         s = self.sound(sid)
         if not s:
             return False
-        d = self.pcm(s)
-        if d is None:
+        e = self._entry(s)
+        if e is None:
             return False
-        frames = len(d) // 2
+        frames = e["frames"]
         a = max(0, min(frames, int((s.get("start") or 0) * RATE)))
         b = frames if s.get("end") is None else max(a, min(frames, int(s["end"] * RATE)))
         g = s.get("vol", 100) / 100 * self.board.get("volume", 100) / 100
-        seg = d[a * 2:b * 2]
-        if np is not None:
-            data = (seg * np.float32(g)).astype(np.float32).tobytes()
-        else:
-            data = array("f", (x * g for x in seg)).tobytes()
         cmd = ["paplay", "--raw", "--format=float32le", f"--rate={RATE}", "--channels=2",
                "--client-name=amx-soundboard", f"--stream-name={s['name']}", "--latency-msec=20"]
         tgt = self.target()
@@ -253,11 +290,23 @@ class Soundboard:
         except OSError:
             return False
 
-        def feed():
+        def feed():                    # stream the trimmed range from the cache, a second at a time
             try:
-                p.stdin.write(data)
+                with open(e["path"], "rb") as fh:
+                    fh.seek(a * FRAME)
+                    left = (b - a) * FRAME
+                    while left > 0:
+                        chunk = fh.read(min(left, RATE * FRAME))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                        if g != 1:
+                            buf = array("f")
+                            buf.frombytes(chunk)
+                            chunk = array("f", map(g.__mul__, buf)).tobytes()
+                        p.stdin.write(chunk)
                 p.stdin.close()
-            except (BrokenPipeError, OSError):
+            except (BrokenPipeError, OSError, ValueError):
                 pass
         threading.Thread(target=feed, daemon=True).start()
         self.playing.setdefault(s["id"], []).append((p, time.monotonic(), (b - a) / RATE))
@@ -327,7 +376,7 @@ class Soundboard:
                 os.unlink(s["file"])
             except OSError:
                 pass
-        self._pcm.pop(s["id"], None)
+        self._meta.pop(s["id"], None)
 
     def export_zip(self, path):
         b = copy.deepcopy(self.board)
@@ -735,269 +784,6 @@ class Instruments:
         self.sync([], set())
 
 
-# =========================================================================== tuner
-NOTES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]
-TUNINGS = {
-    "Chromatic": [],
-    "Guitar (standard)": ["E2", "A2", "D3", "G3", "B3", "E4"],
-    "Guitar (drop D)": ["D2", "A2", "D3", "G3", "B3", "E4"],
-    "Bass (4-string)": ["E1", "A1", "D2", "G2"],
-    "Bass (5-string)": ["B0", "E1", "A1", "D2", "G2"],
-    "Ukulele": ["G4", "C4", "E4", "A4"],
-    "Violin": ["G3", "D4", "A4", "E5"],
-}
-
-
-def note_midi(name):
-    n = name.replace("#", "♯")
-    octave = int(n[-1])
-    return NOTES.index(n[:-1]) + 12 * (octave + 1)
-
-
-def detect_pitch(x, sr):
-    """McLeod pitch method (NSDF peak picking). Returns Hz or None."""
-    x = x - x.mean()
-    if float(np.sqrt(np.mean(x * x))) < 0.004:
-        return None
-    n = len(x)
-    f = np.fft.rfft(x, 2 * n)
-    acf = np.fft.irfft(f * np.conj(f))[:n]
-    sq = x * x
-    cs = np.cumsum(sq)
-    tau = np.arange(n)
-    m = cs[n - 1 - tau] + (cs[n - 1] - np.concatenate(([0.0], cs[:-1]))[tau])
-    nsdf = 2 * acf / np.maximum(m, 1e-12)
-    lo, hi = int(sr / 2100), min(n - 2, int(sr / 25))
-    seg = nsdf[:hi]
-    # key maxima: the highest point of each positive lobe after the first zero crossing
-    neg = np.where(seg < 0)[0]
-    if not len(neg):
-        return None
-    start = neg[0]
-    peaks, i = [], start
-    while i < hi:
-        if seg[i] > 0:
-            j = i
-            while j < hi and seg[j] > 0:
-                j += 1
-            k = i + int(np.argmax(seg[i:j]))
-            if k >= lo:
-                peaks.append(k)
-            i = j
-        else:
-            i += 1
-    if not peaks:
-        return None
-    top = max(seg[k] for k in peaks)
-    if top < 0.6:
-        return None
-    k = next(k for k in peaks if seg[k] >= 0.9 * top)
-    if 0 < k < n - 1:
-        a, b, c = nsdf[k - 1], nsdf[k], nsdf[k + 1]
-        d = a - 2 * b + c
-        k = k + (0.5 * (a - c) / d if d else 0)
-    return sr / k if k > 0 else None
-
-
-class TunerWindow(Adw.Window):
-    def __init__(self, win):
-        super().__init__(title="Tuner", default_width=520, default_height=440, transient_for=win)
-        self.win, self.proc, self.watch = win, None, None
-        self.buf = np.zeros(8192, dtype=np.float32) if np is not None else None
-        self.freq, self.cents, self.note, self.target_name = None, 0.0, "—", None
-        self.smooth = None
-        tv = Adw.ToolbarView()
-        tv.add_top_bar(Adw.HeaderBar(css_classes=["flat"]))
-        self.set_content(tv)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=8, margin_bottom=16,
-                      margin_start=18, margin_end=18)
-        tv.set_content(box)
-        if np is None:
-            box.append(Gtk.Label(label="The tuner needs numpy (python-numpy).", css_classes=["sub"]))
-            return
-        cfg = win.cfg.setdefault("tuner", {})
-        row = Gtk.Box(spacing=8)
-        srcs = self.sources()
-        self.src_vals = [s[1] for s in srcs]
-        self.src_dd = Gtk.DropDown.new_from_strings([s[0] for s in srcs] or ["No inputs"])
-        first_hw = next((c["source"] for c in win.cfg["channels"] if c["type"] == "hw"), None)
-        pick = cfg.get("source") if cfg.get("source") in self.src_vals else first_hw
-        if pick in self.src_vals:
-            self.src_dd.set_selected(self.src_vals.index(pick))
-        self.src_dd.set_hexpand(True)
-        self.src_dd.connect("notify::selected", lambda *_: self.start())
-        row.append(self.src_dd)
-        self.mode_dd = Gtk.DropDown.new_from_strings(list(TUNINGS))
-        modes = list(TUNINGS)
-        self.mode_dd.set_selected(modes.index(cfg["mode"]) if cfg.get("mode") in modes else 0)
-        self.mode_dd.connect("notify::selected", lambda *_: self.build_strings())
-        row.append(self.mode_dd)
-        box.append(row)
-        row2 = Gtk.Box(spacing=8)
-        row2.append(Gtk.Label(label="Concert pitch A4 =", css_classes=["sub"]))
-        self.a4 = Gtk.SpinButton.new_with_range(415, 466, 1)
-        self.a4.set_value(cfg.get("a4", 440))
-        self.a4.connect("value-changed", lambda s: (cfg.__setitem__("a4", int(s.get_value())), win.changed()))
-        row2.append(self.a4)
-        row2.append(Gtk.Label(label="Hz", css_classes=["sub"]))
-        row2.append(Gtk.Box(hexpand=True))
-        self.strings = Gtk.Box(spacing=4)
-        row2.append(self.strings)
-        box.append(row2)
-        self.dial = Gtk.DrawingArea(vexpand=True)
-        self.dial.set_draw_func(self._draw)
-        box.append(self.dial)
-        self.manual = None
-        self.build_strings()
-        self.start()
-        self.tick = GLib.timeout_add(70, self._analyse)
-        self.connect("close-request", lambda *_: (self.stop(final=True), False)[1])
-
-    def sources(self):
-        eng = self.win.eng
-        out = []
-        for s in eng.sources:
-            n = s["name"]
-            if n.endswith(".monitor") or n.startswith(("amx_mix_", "amx_mic_")):
-                continue
-            out.append((s.get("description") or n, n))
-        return out
-
-    def build_strings(self):
-        _clear(self.strings)
-        mode = list(TUNINGS)[self.mode_dd.get_selected()]
-        self.win.cfg["tuner"]["mode"] = mode
-        self.manual = None
-        notes = TUNINGS[mode]
-        if not notes:
-            return
-        auto = Gtk.ToggleButton(label="Auto", active=True)
-        self.strings.append(auto)
-        auto.connect("toggled", lambda b: b.get_active() and setattr(self, "manual", None))
-        for n in notes:
-            b = Gtk.ToggleButton(label=n.replace("♯", "#"), group=auto)
-            b.connect("toggled", lambda bb, n=n: bb.get_active() and setattr(self, "manual", n))
-            self.strings.append(b)
-
-    def start(self):
-        self.stop()
-        if not self.src_vals:
-            return
-        src = self.src_vals[min(self.src_dd.get_selected(), len(self.src_vals) - 1)]
-        self.win.cfg["tuner"]["source"] = src
-        self.win.changed()
-        try:
-            self.proc = subprocess.Popen(["parec", "-d", src, "--format=float32le", f"--rate={RATE}",
-                                          "--channels=1", "--latency-msec=20", "--client-name=amx-tuner"],
-                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        except OSError:
-            return
-        os.set_blocking(self.proc.stdout.fileno(), False)
-        self.watch = GLib.io_add_watch(self.proc.stdout.fileno(), GLib.PRIORITY_DEFAULT,
-                                       GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._data)
-
-    def stop(self, final=False):
-        if self.watch:
-            GLib.source_remove(self.watch)
-            self.watch = None
-        if self.proc:
-            self.proc.kill()
-            self.proc.wait()
-            self.proc = None
-        if final and getattr(self, "tick", None):
-            GLib.source_remove(self.tick)
-            self.tick = None
-
-    def _data(self, fd, _cond):
-        try:
-            data = os.read(fd, 65536)
-        except BlockingIOError:
-            return True
-        except OSError:
-            self.watch = None
-            return False
-        if not data:
-            self.watch = None
-            return False
-        a = np.frombuffer(data[: len(data) // 4 * 4], dtype=np.float32)
-        if len(a) >= len(self.buf):
-            self.buf[:] = a[-len(self.buf):]
-        else:
-            self.buf = np.roll(self.buf, -len(a))
-            self.buf[-len(a):] = a
-        return True
-
-    def _analyse(self):
-        if not self.get_visible():
-            return True
-        mode = list(TUNINGS)[self.mode_dd.get_selected()]
-        low = mode.startswith("Bass")
-        f = detect_pitch(self.buf.astype(np.float64) if low else self.buf[-4096:].astype(np.float64), RATE)
-        a4 = self.a4.get_value()
-        if f:
-            self.smooth = f if self.smooth is None or abs(math.log2(f / self.smooth)) > 0.08 \
-                else self.smooth * 0.7 + f * 0.3
-            f = self.smooth
-            midi = 69 + 12 * math.log2(f / a4)
-            notes = TUNINGS[mode]
-            if self.manual:
-                tgt = note_midi(self.manual)
-            elif notes:
-                tgt = min((note_midi(n) for n in notes), key=lambda m: abs(m - midi))
-            else:
-                tgt = round(midi)
-            self.cents = max(-50.0, min(50.0, (midi - tgt) * 100))
-            self.note = f"{NOTES[tgt % 12]}{tgt // 12 - 1}"
-            self.freq = f
-            self.target_hz = a4 * 2 ** ((tgt - 69) / 12)
-        else:
-            self.freq = None
-        self.dial.queue_draw()
-        return True
-
-    def _draw(self, _a, cr, w, h):
-        cx, cy, r = w / 2, h * 0.86, min(w * 0.45, h * 0.78)
-        cr.set_line_width(2)
-        for c in range(-50, 51, 5):
-            ang = math.pi * (1.5 + c / 100 * 0.9)
-            r1 = r * (0.86 if c % 25 else 0.8)
-            cr.set_source_rgba(1, 1, 1, 0.5 if c % 25 == 0 else 0.2)
-            cr.move_to(cx + r1 * math.cos(ang), cy + r1 * math.sin(ang))
-            cr.line_to(cx + r * math.cos(ang), cy + r * math.sin(ang))
-            cr.stroke()
-        live = self.freq is not None
-        good = live and abs(self.cents) < 5
-        col = (0.45, 0.85, 0.35) if good else (0.21, 0.68, 0.96) if live else (0.4, 0.4, 0.4)
-        ang = math.pi * (1.5 + (self.cents if live else 0) / 100 * 0.9)
-        cr.set_source_rgb(*col)
-        cr.set_line_width(4)
-        cr.move_to(cx, cy)
-        cr.line_to(cx + r * 0.92 * math.cos(ang), cy + r * 0.92 * math.sin(ang))
-        cr.stroke()
-        cr.arc(cx, cy, 7, 0, 2 * math.pi)
-        cr.fill()
-        cr.select_font_face("Sans", 0, 1)
-        cr.set_font_size(min(64, r * 0.45))
-        t = self.note if live else "—"
-        ext = cr.text_extents(t)
-        ty = cy - r * 0.35
-        pad = 10
-        cr.set_source_rgb(0.14, 0.14, 0.15)
-        cr.rectangle(cx - ext.width / 2 - pad, ty + ext.y_bearing - pad, ext.width + 2 * pad, ext.height + 2 * pad)
-        cr.fill()
-        cr.set_source_rgb(*col) if live else cr.set_source_rgba(1, 1, 1, 0.5)
-        cr.move_to(cx - ext.width / 2 - ext.x_bearing, ty)
-        cr.show_text(t)
-        cr.set_font_size(13)
-        cr.select_font_face("Sans", 0, 0)
-        sub = (f"{self.freq:.1f} Hz   ·   {self.cents:+.0f} cents   ·   target {self.target_hz:.1f} Hz"
-               if live else "Play a note")
-        ext = cr.text_extents(sub)
-        cr.set_source_rgba(1, 1, 1, 0.6)
-        cr.move_to(cx - ext.width / 2, cy - r * 0.18)
-        cr.show_text(sub)
-
-
 # =========================================================================== how to run the mixer
 def installed():
     """True for the packaged install (/usr/share/audio-mixer with an `audio-mixer` command)."""
@@ -1079,6 +865,7 @@ class Companion:
         self.mversion = 0
         self.timer = None
         self.error = None
+        self.viewers = 0        # open /api/events streams; with none, state is refreshed only slowly
 
     @property
     def running(self):
@@ -1116,6 +903,7 @@ class Companion:
                     self.end_headers()
                     sv = mv = -1
                     last = time.monotonic()
+                    comp.viewer(+1)
                     try:
                         while comp.httpd is not None:
                             out = b""
@@ -1134,6 +922,8 @@ class Companion:
                             time.sleep(0.05)
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         pass
+                    finally:
+                        comp.viewer(-1)
                 else:
                     self._send(404, "not found", "text/plain")
 
@@ -1184,9 +974,21 @@ class Companion:
 
     _n = 0
 
+    def viewer(self, d):
+        """Called from server threads when a phone connects / leaves."""
+        def apply():
+            self.viewers = max(0, self.viewers + d)
+            if self.viewers == (1 if d > 0 else 0) and self.app.win:
+                self.app.win.sync_meters()        # start / stop the meters it shows
+            return False
+        GLib.idle_add(apply)
+
     def _update(self):
         if not self.httpd:
             return False
+        self._n += 1
+        if not self.viewers and self._n % 10:
+            return True                            # no phone connected: refresh once a second
         try:
             st = json.dumps(self.app.control.state(), sort_keys=True)
         except Exception:
@@ -1194,9 +996,8 @@ class Companion:
         if st != self.state:
             self.state = st
             self.version += 1
-        self._n += 1
         win = self.app.win
-        if win:
+        if win and self.viewers:
             lv = {}
             for cid, v in win.meters.level.items():
                 lv[cid] = round(max(0.0, min(1.0, (20 * math.log10(v) + 54) / 54)) if v > 0.0005 else 0.0, 3)

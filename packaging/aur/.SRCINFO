@@ -19,7 +19,6 @@ pkgbase = audio-mixer-git
 	depends = rnnoise
 	optdepends = pipewire-pulse: PulseAudio compatibility (required on PipeWire systems)
 	optdepends = ffmpeg: soundboard formats other than 16-bit WAV
-	optdepends = python-numpy: instrument tuner
 	optdepends = fluidsynth: MIDI instrument channels
 	optdepends = nvidia-utils: NVIDIA GPU stats on the deck
 	optdepends = opendeck: control the mixer from a real Stream Deck
