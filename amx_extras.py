@@ -998,8 +998,41 @@ class TunerWindow(Adw.Window):
         cr.show_text(sub)
 
 
+# =========================================================================== start at login
+AUTOSTART_FILE = os.path.join(GLib.get_user_config_dir(), "autostart", "io.github.lawsonf.AudioMixer.desktop")
+
+
+def autostart_enabled():
+    return os.path.exists(AUTOSTART_FILE)
+
+
+def set_autostart(on, hidden=True):
+    """Add or remove the XDG autostart entry. hidden: start in the tray instead of opening the window."""
+    if not on:
+        try:
+            os.remove(AUTOSTART_FILE)
+        except FileNotFoundError:
+            pass
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here == "/usr/share/audio-mixer" and shutil.which("audio-mixer"):
+        cmd = "audio-mixer"                       # installed package
+    else:                                         # running from a checkout
+        script = os.path.join(here, "audio_mixer.py").replace("\\", "\\\\").replace('"', '\\"')
+        cmd = f'python3 "{script}"'
+    if hidden:
+        cmd += " --hidden"
+    os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+    with open(AUTOSTART_FILE + ".tmp", "w") as f:
+        f.write("[Desktop Entry]\nType=Application\nName=Audio Mixer\n"
+                "Comment=Wave Link style software mixer for PipeWire\n"
+                f"Exec={cmd}\nIcon=io.github.lawsonf.AudioMixer\nTerminal=false\n"
+                "X-GNOME-Autostart-enabled=true\n")
+    os.replace(AUTOSTART_FILE + ".tmp", AUTOSTART_FILE)
+
+
 # =========================================================================== web companion
-COMPANION_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "companion.html")
+COMPANION_PAGE =os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "companion.html")
 
 
 def companion_html():
@@ -1201,6 +1234,28 @@ class SettingsPage(Gtk.Box):
     def rebuild(self):
         _clear(self.body)
         win, cfg, app = self.win, self.win.cfg, self.win.app
+
+        # ---- startup
+        g = self.group("Startup")
+        hidden = cfg.get("autostart_hidden", True)
+        at = Adw.SwitchRow(title="Start at login", subtitle="Open the mixer automatically when you log in",
+                           active=autostart_enabled())
+        th = Adw.SwitchRow(title="Start in the tray", subtitle="At login, run in the system tray without "
+                                                              "opening the window",
+                           active=hidden, sensitive=at.get_active())
+
+        def apply_autostart(*_a):
+            cfg["autostart_hidden"] = th.get_active()
+            win.changed()
+            th.set_sensitive(at.get_active())
+            try:
+                set_autostart(at.get_active(), th.get_active())
+            except OSError as e:
+                win.toast(f"Couldn't change autostart: {e}")
+        at.connect("notify::active", apply_autostart)
+        th.connect("notify::active", apply_autostart)
+        g.add(at)
+        g.add(th)
 
         # ---- audio
         g = self.group("Audio")

@@ -44,7 +44,7 @@ The **Soundboard** page holds pads with a name, a waveform, play/stop and a stab
 ### Web Companion
 
 **Settings ▸ Web Companion** serves the mixer to any phone or tablet on your network (port 8787 by default) as a mixing console:
-- a channel strip per channel, with insert slots that light up for active effects (tap **FX** to switch any effect or rack unit), DUCK, an LED meter with peak hold, a long-throw fader with a dB scale and readout (double-tap for 0 dB), MUTE and a colour-coded name strip
+- a channel strip per channel, with insert slots that light up for active effects (tap **FX** to switch any effect or rack unit), DUCK, a pan pot (drag sideways, double-tap to centre), an LED meter with peak hold, a long-throw fader with a dB scale and readout (double-tap for 0 dB), MUTE and a colour-coded name strip
 - layer buttons along the top flip the faders between the channel masters and each mix's sends, the way an aux layer works on a desk; in a mix layer each strip has SEND ON/OFF
 - a master section on the right with each mix's master fader, or, inside a mix layer, that mix's master plus a fader and mute for every output device
 - soundboard pads, and scenes (profiles)
@@ -57,6 +57,8 @@ A profile is a whole mixer setup: channels, levels, mutes, routing and effects. 
 
 ### More
 
+- **Pan**: place any channel left or right (Channel settings ▸ Pan, double-click the value to centre). It applies in every mix. The near side stays at full level, so a centred channel is untouched.
+- **Start at login** (Settings ▸ Startup): adds an autostart entry; by default it starts in the tray without opening the window. `audio-mixer --hidden` does the same by hand.
 - **Per-output levels**: each output device of a mix has its own volume and mute (headphones and speakers at once, at different levels).
 - **Instrument tuner** (sidebar ▸ Tuner): any input, chromatic or guitar / bass / ukulele / violin string modes (auto or a fixed string), adjustable concert pitch. Needs `numpy`.
 - **MIDI instrument**: a virtual channel can host a FluidSynth SoundFont (`.sf2`) that every MIDI keyboard plays (Channel settings ▸ MIDI instrument). Needs `fluidsynth` and a SoundFont.
@@ -68,6 +70,7 @@ A profile is a whole mixer setup: channels, levels, mutes, routing and effects. 
   python3 audio_mixer.py ctl fx Mic denoise     # toggle (or: on / off); rack units by name: fx Mic reverb
   python3 audio_mixer.py ctl fx-set Mic gate Threshold -50
   python3 audio_mixer.py ctl profile Streaming
+  python3 audio_mixer.py ctl pan Music L30      # also R30, C, or -100..100
   python3 audio_mixer.py ctl vol Music -5       # also: mute, mix-vol, mix-mute, duck, tuner, state
   ```
 
@@ -82,8 +85,6 @@ The feature set follows [Waveline](https://github.com/Nakildias/Waveline). This 
 
 Arch / CachyOS: `sudo pacman -S python-gobject gtk4 libadwaita python-cairo libpulse gcc rnnoise ffmpeg python-numpy fluidsynth`
 
-## Run
-
 ## Install (Arch / CachyOS)
 
 From the AUR (`audio-mixer-git`):
@@ -93,6 +94,8 @@ paru -S audio-mixer-git     # or: yay -S audio-mixer-git
 ```
 
 Or build it from this repo: `cd packaging/aur && makepkg -si`. That installs the `audio-mixer` command, a menu entry and the icon, and builds the effects plugin at package time. The OpenDeck plugin is at `/usr/share/audio-mixer/opendeck/install.sh`.
+
+## Run
 
 ```sh
 python3 audio_mixer.py
